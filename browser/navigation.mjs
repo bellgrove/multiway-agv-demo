@@ -13,8 +13,25 @@ export class Navigation {
       if (!this.out.has(edge.source)) this.out.set(edge.source, []);
       this.out.get(edge.source).push(edge);
     }
-    for (const t of network.turns)
-      this.turns.set(`${t.incoming}\0${t.outgoing}`, t.duration_s);
+    const edges = new Map(network.edges.map((e) => [e.id, e]));
+    for (const t of network.turns) {
+      const incoming = edges.get(t.incoming),
+        outgoing = edges.get(t.outgoing);
+      const angle =
+        incoming && outgoing
+          ? Math.abs(
+              ((outgoing.entry_heading_deg - incoming.exit_heading_deg + 540) %
+                360) -
+                180,
+            )
+          : null;
+      // Preserve explicit permission even when its nominal turn duration was
+      // copied onto a straight CAD connector. No rotation means no turn time.
+      this.turns.set(
+        `${t.incoming}\0${t.outgoing}`,
+        angle !== null && angle <= 1e-9 ? 0 : t.duration_s,
+      );
+    }
   }
   route(from, to, loaded) {
     const key = `${from}/${to}/${loaded}`;
@@ -95,11 +112,10 @@ export class Navigation {
         ? this.network.stations[from].fork_heading_deg
         : robot.heading_deg;
       for (const { edge, turn, duration } of this.route(from, to, loaded)) {
-        const turnTime =
-          turn ||
-          Math.abs(
-            ((edge.entry_heading_deg - previousHeading + 540) % 360) - 180,
-          ) / 30;
+        const angle = Math.abs(
+          ((edge.entry_heading_deg - previousHeading + 540) % 360) - 180,
+        );
+        const turnTime = angle <= 1e-9 ? 0 : turn || angle / 30;
         if (turnTime)
           add("turn", turnTime, {
             position_m: edge.geometry_m[0],
@@ -202,7 +218,11 @@ export class Navigation {
       travel(source, destination, true);
       handle(destination, "drop");
     }
-    let start = now;
+    // A reserved replacement may approach only after the outgoing fork clears.
+    // Delay at its current mapped position, not inside the occupied station.
+    const dropStart = phases.find((p) => p.kind === "drop_alignment")?.start;
+    let start = Math.max(now, dropStart === undefined ? now :
+      (options.destinationNotBefore ?? now) - dropStart);
     for (let attempts = 0; attempts < 10000; attempts++) {
       let shift = 0;
       for (const p of phases)

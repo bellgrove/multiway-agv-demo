@@ -122,23 +122,34 @@ export function seedWorkingStartup(run) {
   }
   if (reusable.length)
     throw Error("Undeclared surplus starting FIFO identities");
-  for (const m of run.machines) {
-    const eligible = run.input.skus.filter(
+  const lowSkus = run.input.skus.filter(
       (s) =>
         s.id !== "SKU17" &&
         !run.machines.some((other) => other.assignment === s.id),
     );
-    const sku =
-      m.assignment ?? eligible[Math.floor(draw() * eligible.length)].id;
+  const lowPartials = [];
+  const lowSpares = [];
+  for (const m of run.machines) {
+    // Preserve the random stream for high stackers and shared inventory. Low
+    // grades are sampled without replacement; surplus EXISTING bins start empty.
+    const choice = m.assignment ? null : draw();
+    const sku = m.assignment ?? (lowSkus.length
+      ? lowSkus.splice(Math.floor(choice * lowSkus.length), 1)[0].id : null);
+    const fraction = 0.05 + 0.9 * draw();
+    if (!sku) {
+      lowSpares.push(run.bins[m.bin].id);
+      continue;
+    }
     // Strictly partial: no startup ready/full event is skipped by rounding.
-    fill(m.bin, sku, 0.05 + 0.9 * draw());
+    fill(m.bin, sku, fraction);
     m.sku = sku;
+    if (!m.assignment) lowPartials.push({ station: m.id, bin: run.bins[m.bin].id, sku });
     if (m.assignment) {
       const count = Math.floor(draw() * 3);
       for (let tier = 1; tier <= count; tier++) {
         const i = addBin(m.id, 0, tier, "STACK");
         fill(i, sku, 1);
-        m.stack.push(i);
+        m.internalStack.push(i);
       }
     }
   }
@@ -160,7 +171,7 @@ export function seedWorkingStartup(run) {
     });
     (h.sharedInternalCapacity ? h.sharedInternal : h.shared).push(i);
   }
-  h.startup = "preloaded-working-FIFO-two-SKU-v1";
+  h.startup = "preloaded-working-FIFO-two-SKU-spares-v2";
   h.tipperAssignments = { T1: "SKU23", T2: "SKU24" };
   for (const t of run.tippers) t.assignment = h.tipperAssignments[t.id] ?? null;
   h.startupStock = {
@@ -172,6 +183,8 @@ export function seedWorkingStartup(run) {
     physicalBins: run.bins.length,
     addedBins: run.bins.length - 166,
     sharedEmptyBins: sharedCount,
+    lowPartials,
+    lowReadySpareBins: lowSpares,
     tipperAssignments: structuredClone(h.tipperAssignments),
     status:
       "explicit declared initial inventory; not replenishment or fabricated future fruit",

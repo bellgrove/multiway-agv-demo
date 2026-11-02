@@ -1,6 +1,13 @@
+import { installHighRecirculation, sharedTransit, reserveHighLoop, handleHighLoop, wakeFresh } from "./high-local-recirculation.mjs";
+import { refreshFeederPreparation, prepareFeederSource, noteFeederSupply, finishFeederSupply, noteFeederTransfer, feederDestinationReadyAt, donateLocalToFeeder } from "./feeder-preparation.mjs";
 import { seedWorkingStartup } from "./startup.mjs";
 import { chargeIdle, finishCharge, scheduleBatteryWake } from "./charging.mjs";
-import { installParking, returnIdleHome } from "./parking.mjs";
+import {
+  installParking,
+  returnIdleHome,
+  stageHighResponse,
+  stageEmptyResponse,
+} from "./parking.mjs";
 import { RECIPES } from "./recipes.mjs";
 const HIGH_VOLUME_SKUS = ["SKU20", "SKU21", "SKU22", "SKU23", "SKU24"];
 const PREPACK_SKUS = ["SKU09", "SKU19"];
@@ -206,6 +213,8 @@ export function initializeHall(run, options) {
           bin: null,
           queue: null,
           stack: [],
+          internalStack: [],
+          outfeedMoving: false,
           assignment:
             run.input.equipment_config.high_volume_assignments[b.location] ??
             null,
@@ -223,6 +232,7 @@ export function initializeHall(run, options) {
     }
   }
   run.machineById = new Map(run.machines.map((m) => [m.id, m]));
+  installHighRecirculation(run);
   run.tippers = run.input.cells
     .filter((c) => c.id !== "T5")
     .map((c) => ({
@@ -338,6 +348,7 @@ class Hall {
   handle(kind, d) {
     const h = this.hall,
       cfg = this.input.equipment_config;
+    if (handleHighLoop(this, kind, d)) return;
     if (kind === "phase") {
       const job = this.jobs[d.job],
         robot = this.robots[job.robot],
@@ -361,6 +372,9 @@ class Hall {
         if (key === job.destination) continue;
         if (this.leases[key] === job.id) delete this.leases[key];
       }
+      const replacement = this.jobs[job.turnoverReplacementJob];
+      if (replacement?.status === "active")
+        this.leases[job.source] = replacement.id;
       job.sourceReleasedAt = this.time;
       this.record("source-access-released", {
         job: job.id,
@@ -405,21 +419,36 @@ class Hall {
     }
     if (kind === "hall-service") {
       h.serviceScheduled = false;
+      // Only the service event owns dequeueing. An arrival at the exact free
+      // clock must not jump the queue or rotate its head behind newer fruit.
+      if (this.time < this.serviceAt) {
+        h.serviceScheduled = true;
+        this.schedule(this.serviceAt, "hall-service");
+        return;
+      }
       const next = h.serviceQueue.shift();
-      if (next) this.handle(next.kind, next.data);
+      if (!next) return;
+      kind = next.kind;
+      d = next.data;
+    } else if (kind === "hall-fresh" || kind === "hall-regrade") {
+      if (kind === "hall-fresh" && sharedTransit(this) >= cfg.conveyor_capacity) {
+        this.freshWaiting = d;
+        return;
+      }
+      h.serviceQueue.push({ kind, data: d });
+      if (!h.serviceScheduled) {
+        h.serviceScheduled = true;
+        this.schedule(Math.max(this.time, this.serviceAt), "hall-service");
+      }
       return;
     }
     if (kind === "hall-fresh" || kind === "hall-regrade") {
       const fresh = kind === "hall-fresh";
-      if (fresh && this.transit >= cfg.conveyor_capacity) {
+      if (fresh && sharedTransit(this) >= cfg.conveyor_capacity) {
         this.freshWaiting = d;
-        return;
-      }
-      if (this.time < this.serviceAt) {
-        h.serviceQueue.push({ kind, data: d });
-        if (!h.serviceScheduled) {
+        if (h.serviceQueue.length && !h.serviceScheduled) {
           h.serviceScheduled = true;
-          this.schedule(this.serviceAt, "hall-service");
+          this.schedule(Math.max(this.time, this.serviceAt), "hall-service");
         }
         return;
       }
@@ -458,18 +487,21 @@ class Hall {
       return;
     }
     if (kind === "hall-arrive") {
-      const b = this.bins[d.bin];
+      const b = this.bins[d.bin],
+        m = this.machineById.get(b.location);
+      if (!m || m.bin !== d.bin || b.conveyor || b.readyAt > this.time ||
+          !(b.reserved > 0) || (d.sku && d.sku !== b.sku) ||
+          b.fruit_count >= b.fill_count_target ||
+          (m.assignment && b.slot !== 1))
+        throw Error("Fruit arrival requires the actual ready filler bin");
+      b.phase = "filling";
       b.reserved--;
       b.fruit_count++;
       if (b.fruit_count === 1) this.scheduleAgeWake(b);
       b.fruit_mass_kg = b.fruit_count * this.mass(b.sku);
       this.transit--;
       h.transitBySku[b.sku]--;
-      if (this.freshWaiting) {
-        const w = this.freshWaiting;
-        this.freshWaiting = null;
-        this.schedule(Math.max(this.time, this.serviceAt), "hall-fresh", w);
-      }
+      wakeFresh(this);
       if (b.fruit_count === b.fill_count_target) {
         b.phase = "full";
         b.readyAt = this.time + cfg.full_bin_ready_delay;
@@ -517,12 +549,20 @@ class Hall {
       if (d.operation === "high-stack") {
         const m = this.machineById.get(d.location);
         m.stacking = false;
-        m.stack.push(d.bins[0]);
+        m.internalStack.push(d.bins[0]);
         this.count("high-stack");
+      }
+      if (d.operation === "high-outfeed") {
+        const m = this.machineById.get(d.location);
+        if (m.stack.length) throw Error("High outlet outfeed already occupied");
+        m.stack = [...d.bins];
+        m.outfeedMoving = false;
+        this.count("high-outfeed");
       }
       if (d.operation === "high-queue") {
         const m = this.machineById.get(d.location);
         m.bin = d.bins[0];
+        delete m.emptySince;
         m.queue = null;
         m.queueMoving = false;
         const b = this.bins[d.bins[0]];
@@ -584,7 +624,8 @@ class Hall {
       return;
     }
     if (kind === "hall-empty-ready") {
-      this.bins[d.bin].phase = "empty-ready";
+      const b = this.bins[d.bin];
+      b.phase = b.fruit_count > 0 ? "filling" : "empty-ready";
       this.notify("station-empty-ready", this.bins[d.bin].location);
       return;
     }
@@ -729,6 +770,13 @@ class Hall {
     // energy phases and withdrawal-scoped leases, not a second scheduler.
     this.hallBase.handle(kind, d);
   }
+  assignFruitBin(b, sku) {
+    b.sku = sku;
+    b.recipe = RECIPES[sku] ? clone(RECIPES[sku]) : null;
+    b.fill_count_target = this.target(sku);
+    b.sourceGroup = `${sku}:configured-cohort`;
+    b.fruitOrigin = this.time;
+  }
   routeFruit(sku) {
     const h = this.hall;
     if (sku === "SKU17") {
@@ -741,37 +789,48 @@ class Hall {
     }
     const cfg = this.input.equipment_config;
     const fixed = this.machines.some((m) => m.assignment === sku);
+    // Only a physically present filler bin or an already scheduled queue
+    // conveyor has a guaranteed identity and readiness. Do not forecast a
+    // future full-bin departure or an unscheduled empty supply.
+    const targetBin = (m) => m.bin ??
+      (m.assignment && m.queueMoving && this.bins[m.queue]?.conveyor
+        ? m.queue : null);
     const eligible = this.machines
       .filter(
         (m) =>
-          m.bin !== null &&
+          targetBin(m) !== null &&
           (fixed ? m.assignment === sku : !m.assignment) &&
-          this.leases[m.id] === undefined,
+          !(m.assignment && (h.highRecirculation.lanes[m.id].stock + h.highRecirculation.lanes[m.id].inbound)) &&
+          // High-line AGV access is the independent completed-stack outfeed,
+          // not the filler or queued-empty positions. Low filler access remains
+          // a real interlock at the single shared loading/unloading position.
+          (m.assignment || this.leases[m.id] === undefined),
       )
       .filter((m) => {
-        const b = this.bins[m.bin];
+        const b = this.bins[targetBin(m)],
+          queued = m.bin === null,
+          readyAt = queued
+            ? b.conveyor.end + cfg.inserted_empty_ready_delay
+            : b.readyAt,
+          arrivalAt = this.time +
+            (cfg.decision_upstream_distance + this.machines.indexOf(m) * cfg.filler_pitch) /
+              cfg.grader_speed;
         return (
-          b.readyAt <= this.time &&
-          !b.conveyor &&
-          ["empty-ready", "filling"].includes(b.phase) &&
+          readyAt <= (m.assignment ? arrivalAt : this.time) &&
+          (!b.conveyor || queued) &&
+          (queued || ["empty-ready", "filling"].includes(b.phase) ||
+            (m.assignment && b.phase === "inserted")) &&
           (!b.sku || b.sku === sku) &&
           b.fruit_count + b.reserved < this.target(sku)
         );
       });
     const m =
       eligible.find((m) => m.assignment === sku) ??
-      eligible.find((m) => this.bins[m.bin].sku === sku) ??
+      eligible.find((m) => this.bins[targetBin(m)].sku === sku) ??
       eligible[0];
     if (m) {
-      const b = this.bins[m.bin];
-      if (!b.sku) {
-        b.sku = sku;
-        b.recipe = RECIPES[sku] ? clone(RECIPES[sku]) : null;
-        b.fill_count_target = this.target(sku);
-        b.sourceGroup = `${sku}:configured-cohort`;
-        b.fruitOrigin = this.time;
-      }
-      b.phase = "filling";
+      const i = targetBin(m), b = this.bins[i];
+      if (!b.sku) this.assignFruitBin(b, sku);
       b.reserved++;
       m.sku = sku;
       this.count(`route:${m.id}`);
@@ -781,9 +840,10 @@ class Hall {
             this.machines.indexOf(m) * cfg.filler_pitch) /
             cfg.grader_speed,
         "hall-arrive",
-        { bin: m.bin },
+        { bin: i, sku },
       );
     } else {
+      if (fixed && reserveHighLoop(this, sku)) return;
       this.count("recirculation");
       const delay =
         cfg.decision_to_belt_end / cfg.grader_speed +
@@ -866,20 +926,58 @@ class Hall {
         );
       }
     }
-    for (const m of this.machines.filter((m) => m.assignment)) {
+    const outlets = this.machines
+      .filter((m) => m.assignment)
+      .sort((a, b) => {
+        const emptyA = a.bin === null,
+          emptyB = b.bin === null;
+        if (emptyA !== emptyB) return Number(emptyB) - Number(emptyA);
+        if (emptyA)
+          return (
+            (a.emptySince ?? this.time) - (b.emptySince ?? this.time) ||
+            a.id.localeCompare(b.id)
+          );
+        const fraction = (m) =>
+          (this.bins[m.bin].fruit_count + this.bins[m.bin].reserved) /
+          this.target(m.assignment);
+        return fraction(b) - fraction(a) || a.id.localeCompare(b.id);
+      });
+    for (const m of outlets) {
+      if (
+        m.internalStack.length === 3 &&
+        !m.stack.length &&
+        !m.outfeedMoving &&
+        this.leases[m.id] === undefined
+      ) {
+        const bins = m.internalStack.splice(0, 3);
+        m.outfeedMoving = true;
+        const points = [flow.outlets[m.id].stacker, flow.outlets[m.id].pickup];
+        this.record("high-outfeed-transfer", {
+          machine: m.id,
+          bins: bins.map((i) => this.bins[i].id),
+          start: this.time,
+          end: this.time + distance(points) / 0.25,
+        });
+        this.move(bins, points, {
+          operation: "high-outfeed",
+          location: m.id,
+          slot: 3,
+          phase: "full-ready",
+        });
+      }
       if (
         m.bin !== null &&
         this.bins[m.bin].phase === "full-ready" &&
         !m.stacking &&
-        m.stack.length < 3 &&
-        this.leases[m.id] === undefined
+        m.internalStack.length < 3
       ) {
         const i = m.bin,
           b = this.bins[i];
         m.bin = null;
+        m.emptySince = this.time;
         m.stacking = true;
         b.slot = 0;
-        b.tier = m.stack.length + 1;
+        b.tier = m.internalStack.length + 1;
         this.move(
           [i],
           [flow.outlets[m.id].filler, flow.outlets[m.id].stacker],
@@ -1951,7 +2049,7 @@ class Hall {
     const stock = this.localEmptyStatus();
     return stock.assigned - stock.outbound + stock.inbound <= stock.target - 3;
   }
-  assignEmpty(robot, vacant, stores) {
+  assignEmpty(robot, vacant, stores, turnover = {}) {
     const h = this.hall,
       target = this.input.network.nodes[vacant.id];
     for (const store of stores) {
@@ -1963,16 +2061,19 @@ class Hall {
       );
       for (const [slot, stack] of candidates) {
         const i = stack.at(-1);
-        if (i === undefined) continue;
+        if (i === undefined || (turnover.turnoverFor !== undefined &&
+          !h.localEmpty.slots.includes(Number(slot)))) continue;
         const b = this.bins[i];
         if (
           b.sku === null &&
           b.fruit_count === 0 &&
           b.phase === "empty-ready" &&
+          this.leases[`bin:${i}`] === undefined &&
           this.accessible(i) &&
           this.leases[`column:${store}:${slots[slot].lane}`] === undefined &&
           this.missionHall(robot, [i], this.source(i), vacant.id, {
             kind: "empty-low",
+            ...turnover,
             store,
             slot: Number(slot),
           })
@@ -1981,6 +2082,23 @@ class Hall {
       }
     }
     return false;
+  }
+  pipelineLowTurnovers() {
+    for (const carrier of this.robots) {
+      const full = carrier.job === null ? null : this.jobs[carrier.job];
+      if (full?.meta?.kind !== "full-store" ||
+          this.machineById.get(full.source)?.assignment ||
+          full.sourceReleasedAt !== undefined ||
+          full.turnoverReplacementJob !== undefined) continue;
+      const withdrawal = full.phases.find((p) => p.kind === "pickup_withdrawal");
+      if (!withdrawal || withdrawal.end <= this.time) continue;
+      const robot = this.robots.find((r) => r.job === null);
+      if (!robot) break;
+      if (this.assignEmpty(robot, this.machineById.get(full.source), ["low_staging"], {
+        turnoverFor: full.id,
+        destinationNotBefore: withdrawal.end,
+      })) full.turnoverReplacementJob = this.jobs.at(-1).id;
+    }
   }
   localEmptyDestination() {
     const h = this.hall;
@@ -2072,10 +2190,25 @@ class Hall {
     }
     h.sharedPickupBlocked = null;
     const local = this.localEmptyStatus();
+    const projectedLocal = local.assigned - local.outbound + local.inbound;
+    const feederCount = h.feeder.flat().length;
+    const feed = () =>
+      feederCount + h.feederInbound + 3 <=
+        (this.input.equipment_config.feeder_capacity ?? 9) &&
+      feederDestinationReadyAt(this) !== null &&
+      !h.feederInbound &&
+      this.missionHall(robot, bins, "shared_empty", "grader_empty_drop", {
+        kind: "feeder",
+      });
+    // Protect two real local stacks, not an always-full eighteen-bin reserve.
+    // An empty high-volume destacker takes priority over topping local capacity.
     if (
-      local.assigned - local.outbound + local.inbound + bins.length <=
-      local.target
-    ) {
+      projectedLocal >= 6 &&
+      feederCount + h.feederInbound <= 6 &&
+      feed()
+    )
+      return true;
+    if (projectedLocal + bins.length <= local.target) {
       const slot = this.localEmptyDestination();
       if (
         slot &&
@@ -2087,19 +2220,7 @@ class Hall {
       )
         return true;
     }
-    const feederCount = h.feeder.flat().length;
-    if (
-      bins.length === 3 &&
-      feederCount + h.feederInbound + 3 <=
-        (this.input.equipment_config.feeder_capacity ?? 9) &&
-      !h.feeder[0].length &&
-      !h.feederMoving[0] &&
-      !h.feederInbound &&
-      this.missionHall(robot, bins, "shared_empty", "grader_empty_drop", {
-        kind: "feeder",
-      })
-    )
-      return true;
+    if (feed()) return true;
     // User-authorised overflow uses only mapped top-right empty storage, never
     // invented capacity or one overloaded AGV carrying both output stacks.
     const slot = this.storageDestination("empty_staging", bins, true);
@@ -2121,6 +2242,7 @@ class Hall {
     this.tip();
     this.admit();
     const h = this.hall;
+    refreshFeederPreparation(this);
     // Generate actual tasks, then missionHall pairs each with a feasible robot.
     // Charging is admitted before productive pairing, never during a rejected probe.
     const projectedSoc = (robot) =>
@@ -2132,9 +2254,12 @@ class Hall {
       (a, b) => projectedSoc(a) - projectedSoc(b) || a.id.localeCompare(b.id),
     ))
       if (robot.job === null) chargeIdle(this, robot);
+    this.pipelineLowTurnovers();
     for (const robot of this.robots) {
       if (!this.robots.some((r) => r.job === null)) break;
-      let assigned = this.drainSharedPickup(robot);
+      let assigned = prepareFeederSource(this, robot);
+      if (assigned) continue;
+      assigned = this.drainSharedPickup(robot);
       if (assigned) continue;
       // Direct needed empties precede storage; finite bottom refill counts
       // assigned/inbound, while usable stock is projected separately.
@@ -2149,8 +2274,7 @@ class Hall {
         !assigned &&
         count + h.feederInbound + 3 <=
           (this.input.equipment_config.feeder_capacity ?? 9) &&
-        !h.feeder[0].length &&
-        !h.feederMoving[0] &&
+        feederDestinationReadyAt(this) !== null &&
         !h.feederInbound
       ) {
         if (
@@ -2195,8 +2319,7 @@ class Hall {
         if (
           count + h.feederInbound + 3 <=
             (this.input.equipment_config.feeder_capacity ?? 9) &&
-          !h.feeder[0].length &&
-          !h.feederMoving[0] &&
+          feederDestinationReadyAt(this) !== null &&
           !h.feederInbound
         )
           assigned = this.missionHall(
@@ -2222,6 +2345,7 @@ class Hall {
             );
         }
       }
+      if (!assigned) assigned = donateLocalToFeeder(this, robot);
       if (assigned) continue;
       if (
         !h.t5.input.length &&
@@ -2407,6 +2531,7 @@ class Hall {
             })
           ) {
             assigned = true;
+            this.pipelineLowTurnovers();
             break;
           }
         }
@@ -2462,10 +2587,12 @@ class Hall {
           "empty_staging",
         ]);
     }
+    stageHighResponse(this);
+    stageEmptyResponse(this);
     for (const robot of this.robots)
       if (robot.job === null) returnIdleHome(this, robot);
   }
-  rankMissionRobots(bin, source, destination, meta) {
+  rankMissionRobots(bin, source, destination, meta, handlingOptions = {}) {
     const point = this.input.network.nodes[source];
     const region = (p) =>
       p?.[0] >= 40
@@ -2480,6 +2607,9 @@ class Hall {
       let preview;
       try {
         preview = this.hallBase.mission(robot, bin, source, destination, {
+          ...handlingOptions,
+          destinationNotBefore: meta.destinationNotBefore,
+          destinationLeaseOwner: meta.turnoverFor,
           preview: true,
           dropTier: meta.destinationStore
             ? (this.hall.stores[meta.destinationStore][meta.destinationSlot]
@@ -2497,9 +2627,11 @@ class Hall {
       if (!preview) continue;
       const local = region(this.input.network.nodes[robot.location]);
       const bay = /^(P\d+|C1)$/.test(robot.location);
+      const highResponder =
+        robot.location === "HP1" && !!this.machineById.get(source)?.assignment;
       const priority =
         desired === "right"
-          ? bay
+          ? bay || highResponder
             ? 0
             : local === "right"
               ? 1
@@ -2516,10 +2648,18 @@ class Hall {
         priority,
         response,
         completion: preview.phases.at(-1).end,
+        sourceClearance: preview.phases.find((p) => p.kind === "pickup_withdrawal")?.end ?? Infinity,
       });
     }
     return candidates.sort(
       (a, b) =>
+        // Critical empty supply optimizes the actual physical objective before
+        // regional preferences: delivered stock, or clearing a blocked source.
+        (meta.kind === "feeder"
+          ? a.completion - b.completion || a.response - b.response
+          : meta.feederPreparation
+            ? a.sourceClearance - b.sourceClearance || a.response - b.response
+            : 0) ||
         a.priority - b.priority ||
         a.response - b.response ||
         a.completion - b.completion ||
@@ -2630,6 +2770,25 @@ class Hall {
   }
   missionHall(robot, bins, source, destination, meta) {
     bins = [...bins].sort((a, b) => this.bins[a].tier - this.bins[b].tier);
+    if (meta.kind === "feeder") {
+      const readyAt = feederDestinationReadyAt(this);
+      if (readyAt === null || this.hall.feederInbound || bins.length !== 3 ||
+          this.hall.feeder.flat().length + this.hall.feederInbound + bins.length >
+            (this.input.equipment_config.feeder_capacity ?? 9)) return false;
+      meta = { ...meta, destinationNotBefore: readyAt };
+    }
+    if (this.leases[source] !== undefined ||
+        (this.leases[destination] !== undefined &&
+          this.leases[destination] !== meta.turnoverFor)) return false;
+    const highSource = this.machineById.get(source);
+    if (
+      highSource?.assignment &&
+      (bins.length !== 3 ||
+        highSource.stack.length !== 3 ||
+        highSource.outfeedMoving ||
+        bins.some((i) => !highSource.stack.includes(i)))
+    )
+      return false;
     if (source === "shared_empty") {
       const stack = this.sharedPickupStack();
       if (meta.kind === "empty-low" || bins.length !== 3 || stack.length !== 3)
@@ -2698,10 +2857,14 @@ class Hall {
         source,
         destination,
         meta,
+        { emptyPickup: b.sku === null && bins.length === 1 },
       );
       if (!candidates.length) return false;
       robot = candidates[0].robot;
       this.hallBase.mission(robot, bins[0], source, destination, {
+        emptyPickup: b.sku === null && bins.length === 1,
+        destinationNotBefore: meta.destinationNotBefore,
+        destinationLeaseOwner: meta.turnoverFor,
         dropTier: meta.destinationStore
           ? (this.hall.stores[meta.destinationStore][meta.destinationSlot]
               ?.length ?? 0) + 1
@@ -2732,7 +2895,7 @@ class Hall {
     if (meta.kind === "local-empty")
       this.hall.localEmpty.inbound += bins.length;
     if (
-      meta.kind === "empty-low" &&
+      ["empty-low", "feeder"].includes(meta.kind) &&
       meta.store === "low_staging" &&
       this.hall.localEmpty.slots.includes(meta.slot)
     )
@@ -2746,6 +2909,7 @@ class Hall {
     const withdrawal = job.phases.find((p) => p.kind === "pickup_withdrawal");
     if (withdrawal)
       this.schedule(withdrawal.end, "hall-source-released", { job: job.id }, 1);
+    noteFeederSupply(this, job);
     robot.jobsAdmitted = (robot.jobsAdmitted ?? 0) + 1;
     this.count("missions");
     return true;
@@ -2757,7 +2921,7 @@ class Hall {
       meta = job.meta;
     if (d.operation === "pickup") {
       if (
-        meta.kind === "empty-low" &&
+        ["empty-low", "feeder"].includes(meta.kind) &&
         meta.store === "low_staging" &&
         h.localEmpty.slots.includes(meta.slot)
       )
@@ -2816,6 +2980,7 @@ class Hall {
           this.bins[i].phase = "empty-ready";
         }
         this.count("feeder-delivery");
+        finishFeederSupply(this, job);
         this.record("feeder-bottom-delivery", {
           slot: 0,
           bins: job.bins.map((i) => this.bins[i].id),
@@ -2902,6 +3067,7 @@ class Hall {
         destination: job.destination,
       });
     }
+    noteFeederTransfer(this, job, d.operation);
     // Physical station completions, not phase frames, wake dispatch.
     this.notify("station-transfer-complete", job.destination);
   }
@@ -2911,7 +3077,9 @@ class Hall {
     for (const m of this.machines) {
       const full = [
         ...(m.stack ?? []),
-        ...(m.bin !== null && this.bins[m.bin].phase === "full-ready"
+        ...(!m.assignment &&
+        m.bin !== null &&
+        this.bins[m.bin].phase === "full-ready"
           ? [m.bin]
           : []),
       ];
@@ -2940,13 +3108,20 @@ class Hall {
         reason: `local empty stacks: ${local.assigned}/${local.target} assigned, ${local.usable} usable, ${local.inbound} inbound, ${local.outbound} leaving`,
       });
     const count = h.feeder.reduce((n, s) => n + s.length, 0);
-    if (count < 7)
+    if (count + h.feederInbound < (this.input.equipment_config.feeder_capacity ?? 9))
       out.push({
         id: "feeder:supply",
         station: "grader_empty_drop",
         kind: "delivery",
-        status: h.feederInbound ? "assigned" : "waiting",
-        reason: `six-bin objective / below-seven priority; assigned ${count}, inbound ${h.feederInbound}, moving ${Object.keys(h.feederMoving).length}`,
+        status: h.feederInbound ||
+          this.jobs[h.feederPreparation?.preparationJob]?.status === "active"
+          ? "assigned" : "waiting",
+        reason: `${this.jobs[h.feederPreparation?.preparationJob]?.status === "active"
+          ? "real source preparation in progress"
+          : "anticipatory complete-stack supply"}; finite nine-bin target; assigned ${count}, inbound ${h.feederInbound}, moving ${Object.keys(h.feederMoving).length}`,
+        requestReason: h.feederPreparation?.reason ?? null,
+        requestAt: h.feederPreparation?.requestAt ?? this.time,
+        preparationJob: h.feederPreparation?.preparationJob ?? null,
       });
     for (const t of this.tippers)
       if (t.blockReason || t.blocked || t.closureBlocked)

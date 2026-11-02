@@ -569,9 +569,10 @@ export class Experiment {
       this.time,
       this.calendar,
       {
-        emptyPickup: this.bins[bin].sku === null,
+        emptyPickup: options.emptyPickup ?? this.bins[bin].sku === null,
         pickupTier: this.bins[bin].tier,
         dropTier: options.dropTier ?? 1,
+        destinationNotBefore: options.destinationNotBefore,
       },
     );
     const energy = phaseEnergy(phases, this.bins[bin], this.input.energy);
@@ -662,7 +663,9 @@ export class Experiment {
       leaseKeys: [source, destination],
     };
     this.jobs.push(job);
-    for (const key of job.leaseKeys) this.leases[key] = job.id;
+    for (const key of job.leaseKeys)
+      if (key !== destination || options.destinationLeaseOwner === undefined)
+        this.leases[key] = job.id;
     robot.job = job.id;
     if (phases[0].start > this.time)
       robot.phase = {

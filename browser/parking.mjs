@@ -35,7 +35,9 @@ export function installParking(run) {
         blocked: false,
         parking_only: true,
         source_geometry_ids: [
-          from.startsWith("filler-parking:") || to.startsWith("filler-parking:")
+          from.startsWith("empty-response:") || to.startsWith("empty-response:")
+            ? "user-empty-storage-response-2026-11-02-provisional"
+            : from.startsWith("filler-parking:") || to.startsWith("filler-parking:")
             ? "user-upper-left-two-AGV-staging-2026-11-02-provisional"
             : "user-base-left-of-T5-2026-10-29-provisional",
         ],
@@ -149,6 +151,66 @@ export function installParking(run) {
       status: "provisional filler-response idle bay; not a charger",
     });
   }
+  if (run.input.equipment_config.high_response_parking) {
+    const anchor = "xy:41.30583,19.69462";
+    if (!network.nodes[anchor])
+      throw Error("High-volume response junction missing");
+    const id = "HP1",
+      bay = node("high-response:bay:HP1", [40, 21.7]);
+    link(anchor, bay);
+    network.nodes[id] = network.nodes[bay];
+    network.station_nodes[id] = bay;
+    network.stations[id] = {
+      node: bay,
+      fork_heading_deg: 0,
+      approach_s: 0,
+      withdrawal_s: 0,
+      transfer_s: 0,
+      alignment_s: 0,
+      approach_distance_m: 0,
+      lift_speed_mps: 0.1,
+      transfer_height_m: 0,
+      access_motion: "forward",
+      withdrawal_motion: "reverse",
+      resource: `parking:${id}`,
+      source_geometry_ids: [
+        "user-high-volume-response-bay-2026-11-02-provisional",
+      ],
+      arrival_edges: added
+        .filter((e) => e.destination === bay)
+        .map((e) => e.id),
+      departure_edges: added.filter((e) => e.source === bay).map((e) => e.id),
+    };
+    bays.push({
+      id,
+      position_m: network.nodes[bay],
+      capacity: 1,
+      region: "high-volume-response",
+      status: "user-designated response parking; not a charger",
+    });
+  }
+  if (run.input.equipment_config.empty_response_parking ??
+      run.input.equipment_config.high_response_parking) {
+    const anchor = "xy:73.91095,21.90000";
+    if (!network.nodes[anchor]) throw Error("Empty-storage response junction missing");
+    const id = "EP1", bay = node("empty-response:bay:EP1", [72.4, 21.9]);
+    link(anchor, bay);
+    network.nodes[id] = network.nodes[bay];
+    network.station_nodes[id] = bay;
+    network.stations[id] = {
+      node: bay, fork_heading_deg: 0,
+      approach_s: 0, withdrawal_s: 0, transfer_s: 0, alignment_s: 0,
+      approach_distance_m: 0, lift_speed_mps: 0.1, transfer_height_m: 0,
+      access_motion: "forward", withdrawal_motion: "reverse",
+      resource: `parking:${id}`,
+      source_geometry_ids: ["user-empty-storage-response-2026-11-02-provisional"],
+      arrival_edges: added.filter((e) => e.destination === bay).map((e) => e.id),
+      departure_edges: added.filter((e) => e.source === bay).map((e) => e.id),
+    };
+    bays.push({ id, position_m: network.nodes[bay], capacity: 1,
+      region: "empty-storage-response", feederResponse: true,
+      status: "provisional empty-storage/feeder response parking; not a charger or bin position" });
+  }
   const newIds = new Set(added.map((e) => e.id));
   for (const incoming of network.edges)
     for (const outgoing of network.edges)
@@ -179,6 +241,11 @@ export function installParking(run) {
       i >= run.robots.length - 2
         ? `FP${i - (run.robots.length - 2) + 1}`
         : bays[i].id;
+    if (
+      run.input.equipment_config.high_response_parking &&
+      i === run.robots.length - 3
+    )
+      robot.home = "HP1";
     if (i >= 4) {
       robot.location = robot.home;
       robot.position_m = network.nodes[robot.home];
@@ -188,11 +255,15 @@ export function installParking(run) {
   }
   run.navigation = new Navigation(network, run.input.handling);
 }
-export function returnIdleHome(run, robot) {
+export function returnIdleHome(run, robot, preferredDestination = null) {
   if (
     robot.job !== null ||
     robot.carried !== null ||
-    run.hall.parking.bays.some((b) => b.id === robot.location && !b.charger)
+    (preferredDestination
+      ? robot.location === preferredDestination
+      : run.hall.parking.bays.some(
+          (b) => b.id === robot.location && !b.charger,
+        ))
   )
     return false;
   const parking = run.hall.parking;
@@ -203,6 +274,8 @@ export function returnIdleHome(run, robot) {
     .filter(
       (bay) =>
         !bay.charger &&
+        (!bay.feederResponse || preferredDestination === bay.id) &&
+        (!preferredDestination || bay.id === preferredDestination) &&
         (!parking.occupancy[bay.id] ||
           parking.occupancy[bay.id] === robot.id) &&
         run.leases[`parking:${bay.id}`] === undefined,
@@ -299,4 +372,75 @@ export function returnIdleHome(run, robot) {
   });
   run.count("idle-home");
   return true;
+}
+
+// Productive work is assigned first; replenish this response position only with
+// an actually idle, energy-feasible AGV. No extra vehicle or charger is created.
+export function stageHighResponse(run) {
+  if (!run.input.equipment_config.high_response_parking) return false;
+  if (
+    run.leases["parking:HP1"] !== undefined ||
+    run.robots.some((r) => r.location === "HP1" && r.job === null)
+  )
+    return false;
+  const target = run.input.network.nodes.HP1;
+  const candidates = run.robots
+    .filter(
+      (r) =>
+        r.job === null &&
+        r.carried === null &&
+        !["FP1", "FP2", "EP1"].includes(r.location) &&
+        r.soc -
+          (r.power_kw * (run.time - r.energy_time)) / 3600 / r.usable_kwh >
+          run.input.energy.charge_trigger_soc.value,
+    )
+    .sort(
+      (a, b) =>
+        Math.hypot(
+          ...run.input.network.nodes[a.location].map((v, i) => v - target[i]),
+        ) -
+          Math.hypot(
+            ...run.input.network.nodes[b.location].map((v, i) => v - target[i]),
+          ) || a.id.localeCompare(b.id),
+    );
+  for (const robot of candidates)
+    if (returnIdleHome(run, robot, "HP1")) return true;
+  return false;
+}
+
+
+// Optional response positioning is admitted after productive dispatch. It uses
+// the same finite idle mission, traffic calendar and charger-recovery reserve.
+export function stageEmptyResponse(run) {
+  if (!run.input.network.stations.EP1 ||
+      run.leases["parking:EP1"] !== undefined ||
+      run.robots.some((r) => r.location === "EP1" && r.job === null)) return false;
+  const h = run.hall;
+  if (h.feeder.flat().length + h.feederInbound >=
+      (run.input.equipment_config.feeder_capacity ?? 9)) return false;
+  const remoteStock = Object.values(h.stores.empty_staging ?? {}).some((bins) =>
+    bins.some((i) => run.bins[i].sku === null && run.bins[i].fruit_count === 0));
+  if (!remoteStock && !h.shared.length && !h.sharedInternal.length) return false;
+  const point = run.input.network.nodes.EP1;
+  const candidates = run.robots.filter((r) =>
+    r.job === null && r.carried === null &&
+    !["FP1", "FP2", "HP1"].includes(r.location) &&
+    r.soc - (r.power_kw * (run.time - r.energy_time)) / 3600 / r.usable_kwh >
+      run.input.energy.charge_trigger_soc.value,
+  ).sort((a, b) =>
+    Math.hypot(...run.input.network.nodes[a.location].map((v, i) => v - point[i])) -
+    Math.hypot(...run.input.network.nodes[b.location].map((v, i) => v - point[i])) ||
+    a.id.localeCompare(b.id));
+  for (const robot of candidates) {
+    if (!returnIdleHome(run, robot, "EP1")) continue;
+    const job = run.jobs.at(-1);
+    job.meta.feederResponse = true;
+    run.record("feeder-response-stage-admitted", {
+      job: job.id, robot: robot.id, source: job.source, destination: "EP1",
+      requestAt: h.feederPreparation?.requestAt ?? run.time,
+      reason: "finite feeder request pending; position an actually idle AGV near real right-side empty stock",
+    });
+    return true;
+  }
+  return false;
 }

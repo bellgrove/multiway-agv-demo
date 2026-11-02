@@ -160,6 +160,8 @@ worker.onmessage = ({ data: m }) => {
     $("inspect").textContent = JSON.stringify(
       {
         ...object,
+        localRecirculation: s.hall?.highRecirculation?.lanes[selected],
+        feederPreparation: selected === "grader_empty_drop" ? s.hall?.feederPreparation : undefined,
         requests: s.requests.filter(
           (r) =>
             r.station === selected ||
@@ -191,7 +193,13 @@ function locationPoint(b) {
   const high = meta.network.high_volume_flow.outlets[id];
   if (high)
     return high[
-      b.slot === 0 ? "stacker" : b.slot === 1 ? "filler" : "queued_empty"
+      b.slot === 0
+        ? "stacker"
+        : b.slot === 1
+          ? "filler"
+          : b.slot === 3
+            ? "pickup"
+            : "queued_empty"
     ];
   const station = meta.network.stations[id];
   if (station) {
@@ -317,8 +325,12 @@ function draw(m) {
     2,
   );
   const production = m.hall?.production;
+  const localLoops = Object.values(m.hall?.highRecirculation?.lanes ?? {});
+  const localStock = localLoops.reduce((total, lane) => total + lane.stock + lane.inbound, 0);
+  const localCapacity = localLoops.reduce((total, lane) => total + lane.capacity, 0);
   $("production").textContent = production
-    ? `Packed into palletizer transfer groups: ${production.packedFruit.toLocaleString()} fruit · ${production.completedPallets} complete pallets · ${production.emptyBins} empty bins · ${production.chargesCompleted} charges completed`
+    ? `Packed into palletizer transfer groups: ${production.packedFruit.toLocaleString()} fruit · ${production.completedPallets} complete pallets · ${production.emptyBins} empty bins · ${production.chargesCompleted} charges completed` +
+      (localLoops.length ? ` · High-lane local loops: ${localStock}/${localCapacity} fruit (including inbound) · Main-loop returns: ${m.hall.counts.recirculation ?? 0}` : "")
     : "Single-bin circulation witness";
   $("fleet").textContent = m.robots
     .map(

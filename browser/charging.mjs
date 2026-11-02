@@ -1,28 +1,31 @@
 import { phaseEnergy } from "./energy.mjs";
-// Finite single-charger recovery. Idle threshold wakes are predicted events,
+// Finite charger recovery. Idle threshold wakes are predicted events,
 // never fruit/frame polling. Power and geometry remain the cited input values.
 const chargeThreshold = (run) => run.input.energy.charge_trigger_soc.value;
+// Provisional dispatch policy, not a battery/hardware parameter. Setting this
+// internal policy to the recovery threshold disables elective early charging.
+const opportunityThreshold = (run) =>
+  run.input.energy.opportunity_charge_soc?.value ?? 0.55;
 export function scheduleBatteryWake(run, robot) {
-  const threshold = chargeThreshold(run);
   robot.batteryWake = (robot.batteryWake ?? 0) + 1;
   if (robot.job !== null) return;
   const available =
     robot.soc * robot.usable_kwh -
     (robot.power_kw * (run.time - robot.energy_time)) / 3600;
-  const seconds =
-    ((available - threshold * robot.usable_kwh) /
-      run.input.energy.auxiliary_power.value) *
-    3600;
-  if (seconds > 1e-6 && Number.isFinite(seconds))
-    run.schedule(
-      run.time + seconds,
-      "hall-energy-wake",
-      {
-        robot: run.robots.indexOf(robot),
-        token: robot.batteryWake,
-      },
-      1,
-    );
+  // Keep the recovery wake even if an elective wake finds both elective
+  // slots occupied; no periodic retries and no missed low-battery recovery.
+  for (const threshold of new Set([opportunityThreshold(run), chargeThreshold(run)])) {
+    const seconds =
+      ((available - threshold * robot.usable_kwh) /
+        run.input.energy.auxiliary_power.value) * 3600;
+    if (seconds > 1e-6 && Number.isFinite(seconds))
+      run.schedule(
+        run.time + seconds,
+        "hall-energy-wake",
+        { robot: run.robots.indexOf(robot), token: robot.batteryWake },
+        1,
+      );
+  }
 }
 export function chargeIdle(run, robot) {
   const threshold = chargeThreshold(run),
@@ -30,7 +33,16 @@ export function chargeIdle(run, robot) {
   const available =
     robot.soc * robot.usable_kwh -
     (robot.power_kw * (run.time - robot.energy_time)) / 3600;
-  if (available / robot.usable_kwh > threshold + 1e-9) return false;
+  const soc = available / robot.usable_kwh;
+  const opportunity = soc > threshold + 1e-9;
+  if (opportunity) {
+    if (soc > opportunityThreshold(run) + 1e-9) return false;
+    const charging = run.robots.filter((r) =>
+      r.job !== null && run.jobs[r.job]?.meta.kind === "charge",
+    );
+    if (charging.filter((r) => run.jobs[r.job].meta.opportunity).length >= 2 ||
+        run.robots.length - charging.length <= 6) return false;
+  }
   if (robot.carried !== null) return false;
   const charger = run.input.chargers.find(
     (c) =>
@@ -88,6 +100,7 @@ export function chargeIdle(run, robot) {
     leaseKeys: [`charger:${charger.id}`],
     meta: {
       kind: "charge",
+      opportunity,
       suppliedKwh: (batteryPower * duration) / 3600,
       gridKwh: (charger.power.value * duration) / 3600,
     },
