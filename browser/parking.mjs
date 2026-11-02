@@ -34,7 +34,11 @@ export function installParking(run) {
         speeds_mps: { empty: 1, loaded: 0.7 },
         blocked: false,
         parking_only: true,
-        source_geometry_ids: ["user-base-left-of-T5-2026-10-29-provisional"],
+        source_geometry_ids: [
+          from.startsWith("filler-parking:") || to.startsWith("filler-parking:")
+            ? "user-upper-left-two-AGV-staging-2026-11-02-provisional"
+            : "user-base-left-of-T5-2026-10-29-provisional",
+        ],
       };
       network.edges.push(edge);
       added.push(edge);
@@ -83,6 +87,55 @@ export function installParking(run) {
       status: "provisional user-designated idle bay; not a charger",
     });
   }
+  // Two provisional staging bays above/left of the low fillers. These are
+  // idle parking only: C1 and its approach/charging capacity remain unchanged.
+  const fillerAnchor = "xy:-8.46261,26.32305";
+  if (!network.nodes[fillerAnchor])
+    throw Error("Upper-left filler junction missing");
+  let near = node("filler-parking:entry", [-14, 26.32305]);
+  link(fillerAnchor, near);
+  const corner = node("filler-parking:corner", [-14, 27.5]);
+  link(near, corner);
+  near = corner;
+  for (let i = 0; i < 2; i++) {
+    const id = `FP${i + 1}`,
+      x = -12.5 + i * 3,
+      junction = node(`filler-parking:aisle:${i}`, [x, 27.5]),
+      bay = node(`filler-parking:bay:${id}`, [x, 29.5]);
+    link(near, junction);
+    link(junction, bay);
+    near = junction;
+    network.nodes[id] = network.nodes[bay];
+    network.station_nodes[id] = bay;
+    network.stations[id] = {
+      node: bay,
+      fork_heading_deg: 90,
+      approach_s: 0,
+      withdrawal_s: 0,
+      transfer_s: 0,
+      alignment_s: 0,
+      approach_distance_m: 0,
+      lift_speed_mps: 0.1,
+      transfer_height_m: 0,
+      access_motion: "forward",
+      withdrawal_motion: "reverse",
+      resource: `parking:${id}`,
+      source_geometry_ids: [
+        "user-upper-left-two-AGV-staging-2026-11-02-provisional",
+      ],
+      arrival_edges: added
+        .filter((e) => e.destination === bay)
+        .map((e) => e.id),
+      departure_edges: added.filter((e) => e.source === bay).map((e) => e.id),
+    };
+    bays.push({
+      id,
+      position_m: network.nodes[bay],
+      capacity: 1,
+      region: "upper-left-fillers",
+      status: "provisional filler-response idle bay; not a charger",
+    });
+  }
   const newIds = new Set(added.map((e) => e.id));
   for (const incoming of network.edges)
     for (const outgoing of network.edges)
@@ -102,14 +155,17 @@ export function installParking(run) {
         });
       }
   network.parking = {
-    version: 1,
+    version: 2,
     source:
-      "User 2026-10-29: idle AGVs left of T5, charging area; explicit provisional bays/links clear of existing C1 approach",
+      "User 2026-10-29: idle AGVs left of T5, charging area; plus user 2026-11-02 upper-left two-AGV staging; provisional empty-only links, C1 unchanged",
     bays,
   };
   run.hall.parking = { ...structuredClone(network.parking), occupancy: {} };
   for (const [i, robot] of run.robots.entries()) {
-    robot.home = bays[i].id;
+    robot.home =
+      i >= run.robots.length - 2
+        ? `FP${i - (run.robots.length - 2) + 1}`
+        : bays[i].id;
     if (i >= 4) {
       robot.location = robot.home;
       robot.position_m = network.nodes[robot.home];

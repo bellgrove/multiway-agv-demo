@@ -105,7 +105,7 @@ export function seedWorkingStartup(run) {
           tier,
         });
         stack.push(i);
-        fill(i, sku, 1, -100 + slot.depth);
+        fill(i, sku, 1, -100 - slot.depth);
         fifo.push(i);
       }
     }
@@ -113,9 +113,9 @@ export function seedWorkingStartup(run) {
       store,
       lane,
       sku,
-      flow: "right-to-left",
-      entry: "right",
-      retrieval: "left",
+      flow: "left-to-right",
+      entry: "left",
+      retrieval: "right",
       stacks: positions.length,
       bins: positions.length * 3,
     });
@@ -177,7 +177,7 @@ export function seedWorkingStartup(run) {
       "explicit declared initial inventory; not replenishment or fabricated future fruit",
   };
   run.input.purpose =
-    "Preloaded working hall: two uppermost right-to-left FIFO lanes, eight three-high stacks each, T1/SKU23 and T2/SKU24, seeded partial fillers and 0–2 stacker bins";
+    "Preloaded working hall: two uppermost FIFO lanes (load left / unload right), eight three-high stacks each, T1/SKU23 and T2/SKU24, seeded partial fillers and 0–2 stacker bins";
   run.occupancy = new Map();
   for (const b of run.bins) {
     const key = `${b.location}/${b.slot}`;

@@ -63,6 +63,7 @@ export function initializeHall(run, options) {
         "restore three real local three-high stacks; provisional stock policy",
     },
     fifoStores: ["low_staging", "wall_storage"],
+    fullPutawayStores: ["wall_storage"],
     fullBySku: {},
     admission: {},
     stores: {},
@@ -97,9 +98,32 @@ export function initializeHall(run, options) {
             slot.slot,
             slots
               .filter(
-                (front) => front.lane === slot.lane && front.depth < slot.depth,
+                (front) =>
+                  front.lane === slot.lane &&
+                  (store === "wall_storage"
+                    ? front.centre_xy_m[0] > slot.centre_xy_m[0]
+                    : front.depth < slot.depth),
               )
               .map((front) => front.slot),
+          ]),
+        ),
+      ]),
+    ),
+    putawayFronts: Object.fromEntries(
+      Object.entries(run.input.network.storage_slots).map(([store, slots]) => [
+        store,
+        Object.fromEntries(
+          slots.map((slot) => [
+            slot.slot,
+            slots
+              .filter(
+                (other) =>
+                  other.lane === slot.lane &&
+                  (store === "wall_storage"
+                    ? other.centre_xy_m[0] < slot.centre_xy_m[0]
+                    : other.depth < slot.depth),
+              )
+              .map((other) => other.slot),
           ]),
         ),
       ]),
@@ -821,6 +845,7 @@ class Hall {
         );
       if (incoming) return null; // retain the real compatible stack target, not fragmented singleton stock
     }
+    if (store === "wall_storage") return this.fifoDestination(bins);
     // Do not bury another cohort, empty supply, or an unfinished rear stack.
     // A partial stack must remain reachable until completed, and reserved rear
     // stock must remain available to its already-admitted packing run.
@@ -903,6 +928,55 @@ class Hall {
       return slot;
     }
     return null;
+  }
+  fifoDestination(bins) {
+    const h = this.hall,
+      cells = h.stores.wall_storage,
+      slots = this.input.network.storage_slots.wall_storage,
+      source = this.bins[bins[0]];
+    const compatible = (i) => {
+      const b = this.bins[i];
+      return (
+        b.sku === source.sku &&
+        b.sourceGroup === source.sourceGroup &&
+        b.recipe?.version === source.recipe?.version
+      );
+    };
+    const reachable = (slot) =>
+      this.leases[`column:wall_storage:${slot.lane}`] === undefined &&
+      this.planningIndex.putawayFronts.wall_storage[slot.slot].every(
+        (front) => !cells[front]?.length,
+      ) &&
+      slots
+        .filter((s) => s.lane === slot.lane)
+        .every((s) => (cells[s.slot] ?? []).every(compatible));
+    // Complete an accessible partial stack before opening a new stack.
+    const partial = slots
+      .filter((slot) => {
+        const stack = cells[slot.slot] ?? [];
+        return (
+          stack.length &&
+          stack.length + bins.length <= 3 &&
+          stack.every((i) => this.bins[i].batch == null && compatible(i)) &&
+          reachable(slot)
+        );
+      })
+      .sort(
+        (a, b) =>
+          a.centre_xy_m[0] - b.centre_xy_m[0] ||
+          b.centre_xy_m[1] - a.centre_xy_m[1],
+      );
+    if (partial.length) return partial[0];
+    // Load from the left entrance, up against the occupied bank to the right,
+    // then work back towards that entrance. Never pass an occupied position.
+    const candidates = slots
+      .filter((slot) => !cells[slot.slot]?.length && reachable(slot))
+      .sort(
+        (a, b) =>
+          b.centre_xy_m[0] - a.centre_xy_m[0] ||
+          b.centre_xy_m[1] - a.centre_xy_m[1],
+      );
+    return candidates[0] ?? null;
   }
   freeStock(sku) {
     this.hall.compute.stockLookups++;
@@ -1344,29 +1418,29 @@ class Hall {
         target.dropoff_node,
         meta,
       );
-    for (const [slot, bins] of Object.entries(h.stores.empty_staging ?? {}))
-      if (
-        bins.length === 3 &&
-        bins.every(
-          (i) =>
-            this.bins[i].sku === null && this.bins[i].phase === "empty-ready",
-        ) &&
-        this.accessible(bins[0]) &&
-        this.leases[
-          `column:empty_staging:${this.input.network.storage_slots.empty_staging[slot].lane}`
-        ] === undefined
-      ) {
+    // Existing empties do not occupy fruit FIFO indefinitely: replenish the
+    // same finite local buffers from them before borrowing top-right stock.
+    for (const store of ["wall_storage", "empty_staging"])
+      for (const [slot, bins] of Object.entries(h.stores[store] ?? {}))
         if (
+          bins.length === 3 &&
+          bins.every(
+            (i) =>
+              this.bins[i].sku === null && this.bins[i].phase === "empty-ready",
+          ) &&
+          this.accessible(bins[0]) &&
+          this.leases[
+            `column:${store}:${this.input.network.storage_slots[store][slot].lane}`
+          ] === undefined &&
           this.missionHall(
             robot,
             [...bins],
             this.source(bins[0]),
             target.dropoff_node,
-            { ...meta, store: "empty_staging", slot: Number(slot) },
+            { ...meta, store, slot: Number(slot) },
           )
         )
           return true;
-      }
     return false;
   }
   dispatch(triggers) {
@@ -1378,10 +1452,29 @@ class Hall {
     this.tip();
     this.admit();
     const h = this.hall;
+    const readyFillers = this.machines.filter(
+      (m) =>
+        this.leases[m.id] === undefined &&
+        (m.assignment
+          ? m.stack.length === 3
+          : m.bin !== null && this.bins[m.bin].phase === "full-ready"),
+    );
+    const responseDistance = (robot) =>
+      readyFillers.length
+        ? Math.min(
+            ...readyFillers.map((m) =>
+              distance([
+                this.input.network.nodes[robot.location],
+                this.input.network.nodes[m.id],
+              ]),
+            ),
+          )
+        : 0;
     for (const robot of this.robots
       .filter((r) => r.job === null)
       .sort(
         (a, b) =>
+          responseDistance(a) - responseDistance(b) ||
           (a.jobsAdmitted ?? 0) - (b.jobsAdmitted ?? 0) ||
           a.id.localeCompare(b.id),
       )) {
@@ -1596,7 +1689,7 @@ class Hall {
           continue;
         const partialStore =
           bins.length === 1
-            ? h.fifoStores.find((store) =>
+            ? h.fullPutawayStores.find((store) =>
                 Object.values(h.stores[store]).some(
                   (stack) =>
                     stack.length > 0 &&
@@ -1607,13 +1700,15 @@ class Hall {
                         this.bins[i].sourceGroup === source.sourceGroup,
                     ) &&
                     // Ignore permanent rear blockage, but wait for transient leases.
-                    this.planningIndex.fronts[store][
+                    this.planningIndex.putawayFronts[store][
                       this.bins[stack[0]].slot
                     ].every((front) => !h.stores[store][front]?.length),
                 ),
               )
             : null;
-        for (const store of partialStore ? [partialStore] : h.fifoStores) {
+        for (const store of partialStore
+          ? [partialStore]
+          : h.fullPutawayStores) {
           const slot = this.storageDestination(store, bins, true);
           if (
             slot &&
@@ -1681,6 +1776,17 @@ class Hall {
   }
   missionHall(robot, bins, source, destination, meta) {
     bins = [...bins].sort((a, b) => this.bins[a].tier - this.bins[b].tier);
+    if (meta.kind === "full-store" && meta.destinationStore !== "wall_storage")
+      return false;
+    if (meta.store === "wall_storage" && bins.some((i) => !this.accessible(i)))
+      return false;
+    if (
+      meta.destinationStore === "wall_storage" &&
+      this.planningIndex.putawayFronts.wall_storage[meta.destinationSlot].some(
+        (slot) => this.hall.stores.wall_storage[slot]?.length,
+      )
+    )
+      return false;
     if (meta.store) {
       const current = this.hall.stores[meta.store][meta.slot] ?? [];
       if (
