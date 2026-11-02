@@ -2,6 +2,9 @@ import { seedWorkingStartup } from "./startup.mjs";
 import { chargeIdle, finishCharge, scheduleBatteryWake } from "./charging.mjs";
 import { installParking, returnIdleHome } from "./parking.mjs";
 import { RECIPES } from "./recipes.mjs";
+const HIGH_VOLUME_SKUS = ["SKU20", "SKU21", "SKU22", "SKU23", "SKU24"];
+const PREPACK_SKUS = ["SKU09", "SKU19"];
+const T5_SKUS = [...PREPACK_SKUS, "SKU01", "SKU05", "SKU06"];
 const clone = structuredClone;
 const distance = (points) =>
   points
@@ -28,7 +31,7 @@ export function initializeHall(run, options) {
     trace: options.trace ?? null,
     traceIndex: 0,
     counts: {},
-    mass: { initial: 0, admitted: 0, consumed: 0 },
+    mass: { initial: 0, admitted: 0, consumed: 0, admittedError: 0 },
     fruitCount: options.fruitCount ?? Number.MAX_SAFE_INTEGER,
     serviceQueue: [],
     serviceScheduled: false,
@@ -45,29 +48,55 @@ export function initializeHall(run, options) {
       returned: [],
       inbound: 0,
       returnAt: null,
-      status: "provisional thirty-minute whole-stack return",
+      status:
+        "finite whole-stack collection; same empties ready 1800s after drop",
     },
     shared: [],
     sharedInbound: 0,
     sharedReserved: 0,
-    sharedCapacity: 3,
+    sharedCapacity:
+      3 * (run.input.equipment_config.common_output_stack_positions ?? 1),
+    sharedOutputPositions:
+      run.input.equipment_config.common_output_stack_positions ?? 1,
+    sharedInternalCapacity:
+      run.input.equipment_config.common_internal_bin_capacity ?? 0,
+    sharedInternal: [],
+    sharedOutputInbound: 0,
+    sharedOutputMoving: {},
     stackerUntil: 0,
+    ageClearance: {
+      triggerSeconds: 25 * 3600,
+      eligibleSeconds: 20 * 3600,
+      pendingSkus: [],
+      sweeps: [],
+      wakeAt: null,
+    },
     runs: [],
     skuOwners: {},
     localEmpty: {
       slots: [],
-      target: 9,
+      target: 3 * (run.input.equipment_config.local_empty_stack_locations ?? 3),
       inbound: 0,
       outbound: 0,
       status:
-        "restore three real local three-high stacks; provisional stock policy",
+        "restore configured real local three-high stacks; finite reserved mapped slots",
     },
     fifoStores: ["low_staging", "wall_storage"],
-    fullPutawayStores: ["wall_storage"],
+    fullPutawayStores: ["wall_storage", "low_staging"],
+    fifoLaneOwners: {},
     fullBySku: {},
     admission: {},
     stores: {},
     carryover: {},
+    remainderStore: {
+      perSkuTrayCapacity: 40,
+      assumption:
+        "retained conservative 40-tray per-SKU warehouse bound; labelled physical handling duration not calibrated",
+      records: [],
+      transfers: [],
+      inventoryFruit: 0,
+      inventoryMassKg: 0,
+    },
     emptySources: [],
     returnPending: [],
 
@@ -75,14 +104,14 @@ export function initializeHall(run, options) {
       juice:
         "SKU17 bypasses circulating-bin fleet; externally owned offsite stream",
       prepack:
-        "SKU09/SKU19 finite filled-bin storage; external collection not configured",
+        "SKU09/SKU19 collect full three-bin storage stacks to T5; same empties ready 1800s after drop",
     },
     startup: "empty-fruit-FIFO-166-v1",
     policy: "provisional-fixed-count-bounded-closure",
     blockedModes: [
       "size-12 geometric recipe absent",
       "mixed-pallet/weekend/dispatch policy unresolved; unsupported",
-      "no supplemental stock configured; realised shortages block",
+      "realised shortages wait for finite physically accessible same-cohort source groups",
     ],
   };
   const h = run.hall;
@@ -242,7 +271,7 @@ export function initializeHall(run, options) {
   for (const slot of [...localSlots].sort(
     (a, b) => b.centre_xy_m[0] - a.centre_xy_m[0] || b.depth - a.depth,
   )) {
-    if (h.localEmpty.slots.length === 3) break;
+    if (h.localEmpty.slots.length === h.localEmpty.target / 3) break;
     if (
       (cells[slot.slot] ?? []).length ||
       h.localEmpty.slots.some((i) => localSlots[i].lane === slot.lane)
@@ -259,8 +288,24 @@ export function initializeHall(run, options) {
       continue;
     h.localEmpty.slots.push(slot.slot);
   }
-  if (h.localEmpty.slots.length !== 3)
-    throw Error("Three real accessible local empty-buffer slots required");
+  if (h.localEmpty.slots.length !== h.localEmpty.target / 3)
+    throw Error("Configured real accessible local empty-buffer slots required");
+  if (
+    ![1, 2].includes(h.sharedOutputPositions) ||
+    ![0, 3].includes(h.sharedInternalCapacity) ||
+    (!h.sharedInternalCapacity && h.sharedOutputPositions !== 1)
+  )
+    throw Error(
+      "Shared return geometry supports legacy one output/no internal bins, or one/two output stacks with three internal bins",
+    );
+  if (h.sharedInternalCapacity) {
+    run.input.network.nodes.shared_internal = [
+      ...run.input.network.tipper_flow.empty_stacker,
+    ];
+    run.input.network.nodes.shared_intermediate = [
+      ...run.input.network.tipper_flow.intermediate,
+    ];
+  }
   if (options.startup === "working") seedWorkingStartup(run);
   run.schedule(0, "hall-startup", {}, 1);
   if (h.fruitCount) run.schedule(0, "hall-fresh", { number: 0, sku: null });
@@ -344,7 +389,15 @@ class Hall {
         this.notify("battery-threshold", robot.id);
       return;
     }
+    if (kind === "hall-age-wake") {
+      if (d.at !== h.ageClearance.wakeAt) return;
+      h.ageClearance.wakeAt = null;
+      this.refreshAgeClearance();
+      this.notify("age-clearance-threshold", "hall");
+      return;
+    }
     if (kind === "hall-startup") {
+      this.refreshAgeClearance();
       for (const robot of this.robots) scheduleBatteryWake(this, robot);
       this.record("hall-startup", { startup: h.startup });
       this.notify("station-ready", "hall");
@@ -381,7 +434,12 @@ class Hall {
       if (fresh) {
         this.admitted++;
         this.transit++;
-        h.mass.admitted += mass;
+        // Compensate per-fruit accumulation: a full-day high-throughput run
+        // otherwise drifts away from its exact SKU-count-derived admitted mass.
+        const correctedMass = mass - h.mass.admittedError;
+        const admittedMass = h.mass.admitted + correctedMass;
+        h.mass.admittedError = admittedMass - h.mass.admitted - correctedMass;
+        h.mass.admitted = admittedMass;
         h.admittedBySku[sku] = (h.admittedBySku[sku] ?? 0) + 1;
         h.transitBySku[sku] = (h.transitBySku[sku] ?? 0) + 1;
         this.count("grading");
@@ -403,6 +461,7 @@ class Hall {
       const b = this.bins[d.bin];
       b.reserved--;
       b.fruit_count++;
+      if (b.fruit_count === 1) this.scheduleAgeWake(b);
       b.fruit_mass_kg = b.fruit_count * this.mass(b.sku);
       this.transit--;
       h.transitBySku[b.sku]--;
@@ -492,14 +551,30 @@ class Hall {
         );
         this.record("tip-start", { bin: b.id, tipper: t.id });
       }
+      if (
+        d.operation === "shared-output-arrive" ||
+        d.operation === "shared-output-advance"
+      ) {
+        if (d.operation === "shared-output-arrive") {
+          h.sharedOutputInbound -= d.bins.length;
+          h.shared.push(...d.bins);
+        }
+        for (const [tier, i] of d.bins.entries()) this.bins[i].tier = tier + 1;
+        delete h.sharedOutputMoving[d.slot];
+        if (d.operation === "shared-output-advance")
+          delete h.sharedOutputMoving[1];
+        this.count(d.operation);
+      }
       if (d.operation === "shared-arrive") {
         h.sharedInbound--;
-        h.shared.push(d.bins[0]);
-        this.bins[d.bins[0]].tier = h.shared.length;
+        const inventory = h.sharedInternalCapacity
+          ? h.sharedInternal
+          : h.shared;
+        inventory.push(d.bins[0]);
+        this.bins[d.bins[0]].tier = inventory.length;
         this.bins[d.bins[0]].slot = 0;
-        const t = this.tippers.find((t) => t.id === d.tipper);
-        t.bin = null;
-        t.phase = "idle";
+        // This return can arrive after the tipper has started another bin.
+        // Physical tipper ownership was released at its actual empty-exit.
         this.count("shared-empty");
       }
       this.notify(
@@ -511,6 +586,19 @@ class Hall {
     if (kind === "hall-empty-ready") {
       this.bins[d.bin].phase = "empty-ready";
       this.notify("station-empty-ready", this.bins[d.bin].location);
+      return;
+    }
+    if (kind === "hall-tip-exit") {
+      const t = this.tippers[d.tipper];
+      if (t.bin === d.bin && t.phase === "return-conveyor") {
+        t.bin = null;
+        t.phase = "idle";
+        this.record("tip-empty-exit", {
+          tipper: t.id,
+          bin: this.bins[d.bin].id,
+        });
+        this.notify("station-empty-exit", t.id);
+      }
       return;
     }
     if (kind === "hall-tip-empty") {
@@ -534,6 +622,29 @@ class Hall {
       this.count("inspection-rejects", rejects);
       // Only eight equal-height stacks transfer; stack height is predeclared.
       const unit = batch.recipe.size * 8;
+      if (
+        batch.realisedClosure ||
+        batch.ageClearance ||
+        batch.finiteStockResumption
+      ) {
+        // Age exceptions and finite real-stock recovery transfer only whole
+        // realised layers. No forecast loss refund or phantom complete pallet.
+        if (!batch.currentPallet)
+          batch.currentPallet = {
+            id: `${batch.id}:pallet:${batch.completedPallets.length}`,
+            owner: batch.cell,
+            layers: 0,
+          };
+        let remaining = Math.floor(batch.pendingFruit / unit);
+        let palletLayers = batch.currentPallet.layers;
+        batch.heights = [];
+        while (remaining > 0) {
+          const height = Math.min(5, remaining, 20 - palletLayers);
+          batch.heights.push(height);
+          remaining -= height;
+          palletLayers = (palletLayers + height) % 20;
+        }
+      }
       while (
         batch.heights.length &&
         batch.pendingFruit >= batch.heights[0] * unit
@@ -555,13 +666,18 @@ class Hall {
             boundary:
               "complete palletizer output; external dispatch policy unresolved",
           });
-          batch.currentPallet = batch.heights.length
-            ? {
-                id: `${batch.id}:pallet:${batch.completedPallets.length}`,
-                owner: batch.cell,
-                layers: 0,
-              }
-            : null;
+          batch.currentPallet =
+            batch.heights.length ||
+            ((batch.realisedClosure ||
+              batch.ageClearance ||
+              batch.finiteStockResumption) &&
+              batch.tipped < batch.bins.length)
+              ? {
+                  id: `${batch.id}:pallet:${batch.completedPallets.length}`,
+                  owner: batch.cell,
+                  layers: 0,
+                }
+              : null;
         }
       }
       b.fruit_count = 0;
@@ -601,11 +717,7 @@ class Hall {
       const t = this.tippers[d.tipper];
       t.phase = "idle";
       t.run = null;
-      if (
-        Object.values(h.carryover).some((c) => c.owner === t.id && c.fruit > 0)
-      )
-        t.closureBlocked =
-          "cell-owned finite remainder: same-SKU resumption only; incompatible removal/changeover unsupported";
+      delete t.closureBlocked;
       this.notify("station-changeover-complete", t.id);
       return;
     }
@@ -948,7 +1060,7 @@ class Hall {
     }
     return null;
   }
-  fifoDestination(bins) {
+  fifoDestination(bins, ignoreLeases = false, admissionSelected = null) {
     const h = this.hall,
       cells = h.stores.wall_storage,
       slots = this.input.network.storage_slots.wall_storage,
@@ -958,11 +1070,23 @@ class Hall {
       return (
         b.sku === source.sku &&
         b.sourceGroup === source.sourceGroup &&
-        b.recipe?.version === source.recipe?.version
+        b.recipe?.version === source.recipe?.version &&
+        // Admission will tag precisely its selected bins with the new batch.
+        // Any unselected bin would become incompatible after that atomic tag.
+        (!admissionSelected || admissionSelected.has(i)) &&
+        (b.batch ?? null) === (source.batch ?? null)
       );
     };
+    const stagingLane =
+      source.batch == null ? null : h.runs[source.batch]?.fifoStagingLane;
+    const reservedLane = (slot) =>
+      stagingLane == null || slot.lane === stagingLane;
     const reachable = (slot) =>
-      this.leases[`column:wall_storage:${slot.lane}`] === undefined &&
+      reservedLane(slot) &&
+      (h.fifoLaneOwners[slot.lane] === undefined ||
+        h.fifoLaneOwners[slot.lane] === source.batch) &&
+      (ignoreLeases ||
+        this.leases[`column:wall_storage:${slot.lane}`] === undefined) &&
       this.planningIndex.putawayFronts.wall_storage[slot.slot].every(
         (front) => !cells[front]?.length,
       ) &&
@@ -972,7 +1096,7 @@ class Hall {
     const inbound = this.jobs.filter(
       (j) =>
         j.status === "active" &&
-        j.meta?.kind === "full-store" &&
+        ["full-store", "fifo-relocate"].includes(j.meta?.kind) &&
         j.meta.destinationStore === "wall_storage" &&
         j.bins.every(compatible),
     );
@@ -984,8 +1108,22 @@ class Hall {
     for (const j of inbound)
       matchingLanes.add(slots[j.meta.destinationSlot].lane);
     // A temporary lane lease must not fragment one cohort across multiple lanes.
+    const matchingHasSpace = slots.some(
+      (slot) =>
+        reservedLane(slot) &&
+        matchingLanes.has(slot.lane) &&
+        (h.fifoLaneOwners[slot.lane] === undefined ||
+          h.fifoLaneOwners[slot.lane] === source.batch) &&
+        (cells[slot.slot]?.length ?? 0) + bins.length <= 3 &&
+        this.planningIndex.putawayFronts.wall_storage[slot.slot].every(
+          (front) => !cells[front]?.length,
+        ) &&
+        slots
+          .filter((s) => s.lane === slot.lane)
+          .every((s) => (cells[s.slot] ?? []).every(compatible)),
+    );
     const preferred = (slot) =>
-      !matchingLanes.size || matchingLanes.has(slot.lane);
+      !matchingHasSpace || matchingLanes.has(slot.lane);
     // Complete an accessible partial stack before opening a new stack.
     const partial = slots
       .filter((slot) => {
@@ -1035,7 +1173,156 @@ class Hall {
       })
       .sort((a, b) => this.bins[a].fifoEnteredAt - this.bins[b].fifoEnteredAt);
   }
+  binFruitAge(b) {
+    return b.sku && b.fruit_count > 0 && Number.isFinite(b.fruitOrigin)
+      ? Math.max(0, this.time - b.fruitOrigin)
+      : null;
+  }
+  scheduleAgeWake(b) {
+    if (!b.sku || !Number.isFinite(b.fruitOrigin)) return;
+    const policy = this.hall.ageClearance;
+    // Strictly older than 25h, with one timestamped wake, never fruit polling.
+    const at = b.fruitOrigin + policy.triggerSeconds + 0.001;
+    if (at > this.time && (policy.wakeAt === null || at < policy.wakeAt)) {
+      policy.wakeAt = at;
+      this.schedule(at, "hall-age-wake", { at }, 1);
+    }
+  }
+  refreshAgeClearance() {
+    const policy = this.hall.ageClearance;
+    const fruit = this.bins.filter((b) => this.binFruitAge(b) !== null);
+    policy.oldestSeconds = fruit.reduce(
+      (n, b) => Math.max(n, this.binFruitAge(b)),
+      0,
+    );
+    const eligible = [
+      ...new Set(
+        fruit
+          .filter((b) => this.binFruitAge(b) > policy.eligibleSeconds)
+          .map((b) => b.sku),
+      ),
+    ];
+    // A triggered sweep persists while its aged fruit is waiting for physical
+    // collection, including stock still filling. It never grants younger
+    // cohorts a blanket minimum exemption merely for sharing the SKU.
+    const pending = new Set(
+      policy.pendingSkus.filter((sku) => eligible.includes(sku)),
+    );
+    if (policy.oldestSeconds > policy.triggerSeconds) {
+      const added = eligible.filter((sku) => !pending.has(sku));
+      if (added.length) {
+        policy.sweeps.push({
+          time: this.time,
+          oldestSeconds: policy.oldestSeconds,
+          skus: added,
+        });
+        this.record("age-clearance-trigger", {
+          skus: added,
+          oldestSeconds: policy.oldestSeconds,
+        });
+      }
+      for (const sku of eligible) pending.add(sku);
+    }
+    policy.pendingSkus = [...pending];
+    for (const b of fruit) this.scheduleAgeWake(b);
+  }
+  agedCohort(sku, bins) {
+    return (
+      this.hall.ageClearance.pendingSkus.includes(sku) &&
+      bins.some(
+        (i) =>
+          this.binFruitAge(this.bins[i]) >
+          this.hall.ageClearance.eligibleSeconds,
+      )
+    );
+  }
+  syncRemainderStore() {
+    const h = this.hall,
+      active = h.remainderStore.records.filter((r) => r.status === "stored");
+    h.carryover = {};
+    for (const record of active) h.carryover[record.sku] ??= clone(record);
+    h.remainderStore.inventoryFruit = active.reduce((n, r) => n + r.fruit, 0);
+    h.remainderStore.inventoryMassKg = active.reduce((n, r) => n + r.massKg, 0);
+    h.remainderStore.trayPositions = active.reduce(
+      (n, r) => n + r.trayPositions,
+      0,
+    );
+  }
+  recallRemainders(batch, records) {
+    batch.recalledRemainders = [];
+    for (const record of records) {
+      if (record.status !== "stored")
+        throw Error("Remainder already reserved/recalled");
+      record.status = "recalled";
+      record.recalledAt = this.time;
+      record.destinationBatch = batch.id;
+      batch.recalledRemainders.push(record.id);
+      this.hall.remainderStore.transfers.push({
+        time: this.time,
+        kind: "recall",
+        record: record.id,
+        fruit: record.fruit,
+        massKg: record.massKg,
+        from: "labelled-remainder-store",
+        to: batch.cell,
+        batch: batch.id,
+      });
+    }
+    batch.carryoverInputFruit = records.reduce((n, r) => n + r.fruit, 0);
+    const origins = records.map((r) => r.fruitOrigin).filter(Number.isFinite);
+    batch.carryoverFruitOrigin = origins.length ? Math.min(...origins) : null;
+    this.syncRemainderStore();
+    if (records.length) this.notify("remainder-stock-recalled", batch.cell);
+  }
+  storeRemainder(batch) {
+    const warehouse = this.hall.remainderStore;
+    if (batch.pendingFruit === 0) return true;
+    if (warehouse.records.some((r) => r.sourceBatch === batch.id)) return true;
+    const trayPositions = Math.ceil(batch.pendingFruit / batch.recipe.size);
+    const occupied = warehouse.records
+      .filter((r) => r.status === "stored" && r.sku === batch.sku)
+      .reduce((n, r) => n + r.trayPositions, 0);
+    if (
+      batch.pendingFruit >= 40 * batch.recipe.size ||
+      occupied + trayPositions > warehouse.perSkuTrayCapacity
+    )
+      return false;
+    const origins = [
+      ...batch.sourceInventory.map((b) => b.fruitOrigin),
+      batch.carryoverFruitOrigin,
+    ].filter(Number.isFinite);
+    const record = {
+      id: `remainder:${batch.id}`,
+      status: "stored",
+      sku: batch.sku,
+      sourceGroup: batch.sourceGroup,
+      recipe: batch.recipe.version,
+      fruit: batch.pendingFruit,
+      massKg: batch.pendingFruit * this.mass(batch.sku),
+      trayPositions,
+      fruitOrigin: origins.length ? Math.min(...origins) : null,
+      storedAt: this.time,
+      owner: "labelled-remainder-store",
+      sourceCell: batch.cell,
+      sourceBatch: batch.id,
+    };
+    warehouse.records.push(record);
+    warehouse.transfers.push({
+      time: this.time,
+      kind: "store",
+      record: record.id,
+      fruit: record.fruit,
+      massKg: record.massKg,
+      from: batch.cell,
+      to: record.owner,
+      batch: batch.id,
+    });
+    this.syncRemainderStore();
+    this.record("remainder-stored", { ...record });
+    return true;
+  }
   admit() {
+    this.refreshAgeClearance();
     const h = this.hall,
       // Reuse only within this admission pass, never across physical events.
       stocks = new Map(
@@ -1059,14 +1346,29 @@ class Hall {
     }
     for (const t of this.tippers) {
       if (t.run !== null || t.phase !== "idle" || t.blocked) continue;
-      for (const [sku, recipe] of Object.entries(RECIPES)) {
+      // Startup assignments only reserve the opening two preloaded lanes.
+      // Thereafter prefer an overdue cohort, then stock already in FIFO, then
+      // the largest pressure relative to the minimum at this cell's real rate.
+      const candidates = Object.entries(RECIPES).sort(([a, ar], [b, br]) => {
+        const as = stocks.get(a),
+          bs = stocks.get(b);
+        const aged =
+          Number(this.agedCohort(b, bs)) - Number(this.agedCohort(a, as));
+        if (aged) return aged;
+        const wall = (stock) =>
+          stock.filter((i) => this.bins[i].location === "wall_storage").length;
+        return (
+          Number(wall(bs) >= br.minimum) - Number(wall(as) >= ar.minimum) ||
+          bs.length / br.minimum - as.length / ar.minimum ||
+          (this.planningIndex.cells.get(t.id).consumption[b]?.value ?? 0) -
+            (this.planningIndex.cells.get(t.id).consumption[a]?.value ?? 0)
+        );
+      });
+      for (const [sku, recipe] of candidates) {
         if (
           (t.assignment && t.assignment !== sku) ||
           Object.entries(h.tipperAssignments ?? {}).some(
             ([cell, assigned]) => assigned === sku && cell !== t.id,
-          ) ||
-          Object.entries(h.carryover).some(
-            ([k, c]) => c.owner === t.id && c.fruit > 0 && k !== sku,
           ) ||
           h.skuOwners[sku] !== undefined ||
           !this.planningIndex.cells
@@ -1075,23 +1377,28 @@ class Hall {
         )
           continue;
         const stock = stocks.get(sku);
-        if (stock.length < recipe.minimum) continue;
-        const carryRecord = h.carryover[sku];
-        const hasCarry = carryRecord?.fruit > 0;
-        if (
-          hasCarry &&
-          (carryRecord.owner !== t.id || carryRecord.recipe !== recipe.version)
-        ) {
-          h.admission[sku].state = "blocked-cell-owned-carryover";
-          h.admission[sku].carryover = clone(carryRecord);
+        if (stock.length < recipe.minimum && !this.agedCohort(sku, stock))
           continue;
-        }
-        const groups = hasCarry
-          ? [carryRecord.sourceGroup]
-          : [...new Set(stock.map((i) => this.bins[i].sourceGroup))];
+        const groups = [...new Set(stock.map((i) => this.bins[i].sourceGroup))];
         // Stock is oldest-first; skip cohorts that cannot form a physically
         // accessible recipe-valid run, without pooling their fruit or carryover.
         for (const group of groups) {
+          const carryRecords = h.remainderStore.records.filter(
+            (r) =>
+              r.status === "stored" &&
+              r.sku === sku &&
+              r.sourceGroup === group &&
+              r.recipe === recipe.version,
+          );
+          const hasCarry = carryRecords.length > 0;
+          const carryRecord = hasCarry
+            ? {
+                fruit: carryRecords.reduce((n, r) => n + r.fruit, 0),
+                sourceGroup: group,
+                recipe: recipe.version,
+                owner: "labelled-remainder-store",
+              }
+            : null;
           const compatible = stock.filter(
             (i) =>
               this.bins[i].sourceGroup === group &&
@@ -1103,7 +1410,19 @@ class Hall {
           const reachable = compatible.filter((i) =>
             this.accessible(i, selected),
           );
-          if (reachable.length < recipe.minimum) {
+          const ageClearance = this.agedCohort(sku, reachable);
+          const flexible = !!h.startupStock;
+          // One lane contains 24 bins. Clearing whole stacks up to that real
+          // lane capacity avoids leaving a sub-minimum residue at its entrance.
+          const required = flexible
+            ? Math.min(reachable.length, Math.max(24, recipe.minimum))
+            : ageClearance
+              ? Math.min(reachable.length, recipe.minimum)
+              : recipe.minimum;
+          if (
+            !required ||
+            (reachable.length < recipe.minimum && !ageClearance)
+          ) {
             if (hasCarry) {
               h.admission[sku].state = "blocked-incompatible-cohort-resumption";
               h.admission[sku].carryover = clone(carryRecord);
@@ -1114,6 +1433,10 @@ class Hall {
             const x = this.bins[a],
               y = this.bins[b];
             return (
+              (flexible
+                ? Number(y.location === "wall_storage") -
+                  Number(x.location === "wall_storage")
+                : 0) ||
               (x.fifoEnteredAt ?? Infinity) - (y.fifoEnteredAt ?? Infinity) ||
               x.location.localeCompare(y.location) ||
               x.slot - y.slot ||
@@ -1130,21 +1453,67 @@ class Hall {
             if (!physical.has(key)) physical.set(key, []);
             physical.get(key).push(i);
           }
+          // FIFO age never permits selecting rear stock through younger front
+          // stock. Order source stacks by real withdrawal dependencies first,
+          // using oldest age only among the currently reachable choices.
+          const pendingStacks = [...physical.values()],
+            physicalOrder = [],
+            cleared = new Set();
+          while (pendingStacks.length) {
+            const next = pendingStacks.findIndex((stack) => {
+              const selected = new Set([...cleared, ...stack]);
+              return stack.every((i) => this.accessible(i, selected));
+            });
+            if (next < 0) break;
+            const [stack] = pendingStacks.splice(next, 1);
+            physicalOrder.push(stack);
+            for (const i of stack) cleared.add(i);
+          }
+          const physicallySelectable = (indices) => {
+            const selected = new Set(indices);
+            return indices.every((i) => this.accessible(i, selected));
+          };
           let plans = new Map([[0, []]]);
-          for (const stack of physical.values()) {
+          for (const stack of physicalOrder) {
             // A partial pickup must take the physical top. FIFO age orders stacks,
             // never permits reaching through an older bottom bin's upper tiers.
             stack.sort((a, b) => this.bins[b].tier - this.bins[a].tier);
             const next = new Map(plans),
-              sizes =
-                stack.length >= 3 ? [3, 2] : stack.length === 2 ? [2] : [];
+              sizes = flexible
+                ? [stack.length]
+                : ageClearance
+                  ? [3, 2, 1].filter((n) => n <= stack.length)
+                  : stack.length >= 3
+                    ? [3, 2]
+                    : stack.length === 2
+                      ? [2]
+                      : [];
             for (const [count, plan] of plans)
               for (const size of sizes)
-                if (count + size <= recipe.minimum && !next.has(count + size))
+                if (
+                  count + size <= required &&
+                  !next.has(count + size) &&
+                  (
+                    h.stores[this.bins[stack[0]].location][
+                      this.bins[stack[0]].slot
+                    ] ?? []
+                  )
+                    .slice(-size)
+                    .every((i) => stack.slice(0, size).includes(i)) &&
+                  physicallySelectable([
+                    ...plan.flat(),
+                    ...stack.slice(0, size),
+                  ])
+                )
                   next.set(count + size, [...plan, stack.slice(0, size)]);
             plans = next;
           }
-          const transport = plans.get(recipe.minimum);
+          const chosenCount = flexible
+            ? [...plans.keys()]
+                .filter((n) => n > 0 && (n >= recipe.minimum || ageClearance))
+                .sort((a, b) => b - a)[0]
+            : required;
+          const transport = plans.get(chosenCount);
           if (!transport) {
             h.admission[sku].state =
               "waiting-complete-three-bin-or-terminal-pair-source-groups";
@@ -1153,13 +1522,31 @@ class Hall {
           const bins = transport.flat(),
             chosen = new Set(bins);
           if (bins.some((i) => !this.accessible(i, chosen))) continue;
+          // Never occupy a production cell with low-area stock that has no
+          // real FIFO staging route. Reserve the physical lane atomically with
+          // admission, so another cell cannot take its only staging capacity.
+          const lowGroup = transport.find(
+            (g) => this.bins[g[0]].location !== "wall_storage",
+          );
+          const staging = lowGroup
+            ? this.fifoDestination(lowGroup, false, chosen)
+            : null;
+          if (lowGroup && !staging) {
+            h.admission[sku].state = "waiting-physical-FIFO-staging-lane";
+            continue;
+          }
           const carry = hasCarry ? carryRecord.fruit : 0,
             raw = bins.reduce((n, i) => n + this.bins[i].fruit_count, 0);
           const expected = (raw * 0.995 + carry) / (8 * recipe.size),
-            goal = Math.floor(expected / 20) * 20;
+            goal =
+              ageClearance || flexible ? 0 : Math.floor(expected / 20) * 20;
           // Bounded guard: no unlimited supplemental supply, <=five-layer
           // forecast surplus. Actual shortages remain explicitly unfinished.
-          if (goal < recipe.minimum * recipe.layers || expected - goal >= 5)
+          if (
+            !ageClearance &&
+            !flexible &&
+            (goal < recipe.minimum * recipe.layers || expected - goal >= 5)
+          )
             continue;
           const heights = [];
           for (let n = goal; n > 0; n -= Math.min(5, n))
@@ -1169,6 +1556,19 @@ class Hall {
             sku,
             recipe: clone(recipe),
             sourceGroup: group,
+            realisedClosure: flexible,
+            fifoStagingLane: staging?.lane ?? null,
+            ageClearance: ageClearance
+              ? {
+                  triggeredAt: h.ageClearance.sweeps.at(-1)?.time,
+                  eligibleSeconds: h.ageClearance.eligibleSeconds,
+                  originalMinimum: recipe.minimum,
+                  actualBins: bins.length,
+                  oldestSeconds: Math.max(
+                    ...bins.map((i) => this.binFruitAge(this.bins[i]) ?? 0),
+                  ),
+                }
+              : null,
             bins,
             sourceInventory: bins.map((i) => ({
               bin: this.bins[i].id,
@@ -1203,21 +1603,30 @@ class Hall {
             supplementLimit: 0,
             status: "provisional-selected-recipe",
           };
-          delete h.carryover[sku];
           h.runs.push(batch);
+          if (staging) h.fifoLaneOwners[staging.lane] = batch.id;
+          // These pins describe startup only, not permanent cell restrictions.
+          if (t.assignment) {
+            delete t.assignment;
+            delete h.tipperAssignments[t.id];
+          }
+          this.recallRemainders(batch, carryRecords);
           h.admission[sku].state = "reserved";
           h.admission[sku].owner = t.id;
           delete t.closureBlocked;
           t.run = batch.id;
           h.skuOwners[sku] = t.id;
           for (const i of bins) this.bins[i].batch = batch.id;
-          this.record("normal-admitted", {
-            batch: batch.id,
-            sku,
-            bins: bins.map((i) => this.bins[i].id),
-            source: recipe.source,
-            minimum: recipe.minimum,
-          });
+          this.record(
+            ageClearance ? "age-clearance-admitted" : "normal-admitted",
+            {
+              batch: batch.id,
+              sku,
+              bins: bins.map((i) => this.bins[i].id),
+              source: recipe.source,
+              minimum: recipe.minimum,
+            },
+          );
           this.count("batch-admitted");
           break;
         }
@@ -1228,13 +1637,70 @@ class Hall {
     // filler. Dispatch below reports actual transport/space/energy blockers.
     for (const m of this.machines) m.blocked = null;
   }
+  sharedPickupStack() {
+    return this.hall.shared
+      .filter((i) => {
+        const b = this.bins[i];
+        return b.location === "shared_empty" && b.slot === 0 && !b.conveyor;
+      })
+      .sort((a, b) => this.bins[a].tier - this.bins[b].tier);
+  }
+  advanceSharedOutputs() {
+    const h = this.hall,
+      flow = this.input.network.tipper_flow;
+    if (!h.sharedInternalCapacity) return;
+    const at = (slot) => h.shared.filter((i) => this.bins[i].slot === slot);
+    if (
+      h.sharedOutputPositions === 2 &&
+      !at(0).length &&
+      at(1).length === 3 &&
+      !h.sharedOutputMoving[0] &&
+      !h.sharedOutputMoving[1] &&
+      this.leases.shared_empty === undefined
+    ) {
+      const bins = at(1);
+      h.sharedOutputMoving[0] = h.sharedOutputMoving[1] = true;
+      this.move(bins, [flow.intermediate, flow.pickup], {
+        operation: "shared-output-advance",
+        location: "shared_empty",
+        slot: 0,
+        phase: "empty-ready",
+      });
+    }
+    const slot = h.sharedOutputPositions - 1;
+    if (
+      h.sharedInternal.length === 3 &&
+      !at(slot).length &&
+      !h.sharedOutputMoving[slot] &&
+      (slot !== 0 || this.leases.shared_empty === undefined)
+    ) {
+      const bins = h.sharedInternal.splice(0, 3);
+      h.sharedOutputMoving[slot] = true;
+      h.sharedOutputInbound += bins.length;
+      this.move(
+        bins,
+        slot === 1
+          ? [flow.empty_stacker, flow.intermediate]
+          : [flow.empty_stacker, flow.intermediate, flow.pickup],
+        {
+          operation: "shared-output-arrive",
+          location: slot === 1 ? "shared_intermediate" : "shared_empty",
+          slot,
+          phase: "empty-ready",
+        },
+      );
+    }
+  }
   sharedReturns() {
+    this.advanceSharedOutputs();
     const h = this.hall,
       flow = this.input.network.tipper_flow;
     while (
       h.returnPending.length &&
-      h.shared.length + h.sharedInbound < h.sharedCapacity &&
-      this.leases.shared_empty === undefined
+      (h.sharedInternalCapacity
+        ? h.sharedInternal.length + h.sharedInbound < h.sharedInternalCapacity
+        : h.shared.length + h.sharedInbound < h.sharedCapacity &&
+          this.leases.shared_empty === undefined)
     ) {
       const d = h.returnPending.shift(),
         t = this.tippers[d.tipper],
@@ -1245,11 +1711,16 @@ class Hall {
       const stackAt = Math.max(this.time + toStacker, h.stackerUntil);
       const start = stackAt - toStacker;
       h.stackerUntil = stackAt + this.input.handling.single_stack.value;
-      if (!t.outputReserved) throw Error("Tip output reservation missing");
-      h.sharedReserved--;
-      t.outputReserved = false;
+      // Reserve finite shared output only when the empty actually enters its
+      // return flow, not throughout the preceding fruit-tipping operation.
       h.sharedInbound++;
       t.phase = "return-conveyor";
+      this.schedule(
+        start + distance([g.tip, g.empty_exit]) / 0.25,
+        "hall-tip-exit",
+        { tipper: d.tipper, bin: d.bin },
+        1,
+      );
       this.move(
         [d.bin],
         [
@@ -1257,13 +1728,14 @@ class Hall {
           g.empty_exit,
           g.return_corner,
           flow.empty_stacker,
-          flow.intermediate,
-          flow.pickup,
+          ...(h.sharedInternalCapacity ? [] : [flow.intermediate, flow.pickup]),
         ],
         {
           operation: "shared-arrive",
           tipper: t.id,
-          location: "shared_empty",
+          location: h.sharedInternalCapacity
+            ? "shared_internal"
+            : "shared_empty",
           phase: "empty-ready",
         },
         this.input.handling.single_stack.value,
@@ -1276,6 +1748,92 @@ class Hall {
         t.blockReason = "finite shared empty stacker full/inbound";
       } else delete t.blockReason;
   }
+  resumeShortfall(t, batch) {
+    if (batch.finiteStockResumption) return false;
+    const stock = this.freeStock(batch.sku);
+    // One finite real source group stays within the same cohort and cell;
+    // its entire surplus is drained as realised layers, not abandoned as a
+    // new whole-bin carryover deadlock or stranded FIFO front pair.
+    const i = stock.find((i) => {
+      const b = this.bins[i];
+      const stack = this.hall.stores[b.location]?.[b.slot];
+      return (
+        b.fruit_count > 0 &&
+        b.sourceGroup === batch.sourceGroup &&
+        b.recipe?.version === batch.recipe.version &&
+        stack?.at(-1) === i &&
+        this.accessible(i) &&
+        this.leases[this.source(i)] === undefined
+      );
+    });
+    if (i === undefined) return false;
+    const b = this.bins[i];
+    const available = new Set(stock);
+    const stack = this.hall.stores[b.location][b.slot];
+    const bins = [];
+    // Clear one whole compatible top source group (up to three actual bins).
+    // Shaving just one bin off a FIFO three-stack leaves an untransportable
+    // front pair for subsequent normal batches; the entire group is finite.
+    for (const j of [...stack].reverse()) {
+      const x = this.bins[j];
+      if (
+        bins.length === 3 ||
+        !available.has(j) ||
+        x.sourceGroup !== batch.sourceGroup ||
+        x.recipe?.version !== batch.recipe.version
+      )
+        break;
+      bins.push(j);
+    }
+    batch.finiteStockResumption = {
+      time: this.time,
+      originalGoalLayers: batch.goalLayers,
+      missingFruit: Math.max(
+        0,
+        batch.heights.reduce((n, h) => n + h, 0) * batch.recipe.size * 8 -
+          batch.pendingFruit,
+      ),
+      bin: b.id,
+      bins: bins.map((i) => this.bins[i].id),
+      groupSize: bins.length,
+      fruit: bins.reduce((n, i) => n + this.bins[i].fruit_count, 0),
+      source: b.location,
+      reason:
+        "realised shortfall; one actual same-cohort source group, entire realised surplus packed",
+    };
+    batch.bins.push(...bins);
+    for (const j of bins) {
+      const x = this.bins[j];
+      batch.sourceInventory.push({
+        bin: x.id,
+        fifoEnteredAt: x.fifoEnteredAt,
+        fruitOrigin: x.fruitOrigin,
+        fruit: x.fruit_count,
+        finiteSupplement: true,
+      });
+      batch.initialFruit += x.fruit_count;
+      x.batch = batch.id;
+    }
+    batch.transportGroups.push({
+      bins,
+      source: b.location,
+      slot: b.slot,
+      status: "reserved",
+      job: null,
+      finiteSupplement: true,
+    });
+    batch.supplementLimit = bins.length;
+    batch.phase = "reserved";
+    t.blocked = null;
+    t.phase = "idle";
+    this.record("batch-real-stock-resumption", {
+      batch: batch.id,
+      sku: batch.sku,
+      ...batch.finiteStockResumption,
+    });
+    this.count("batch-real-stock-resumption");
+    return true;
+  }
   tip() {
     const h = this.hall;
     for (const [ti, t] of this.tippers.entries()) {
@@ -1286,20 +1844,10 @@ class Hall {
         this.leases[t.id] !== undefined
       )
         continue;
-      if (
-        h.shared.length + h.sharedInbound + h.sharedReserved >=
-          h.sharedCapacity ||
-        this.leases.shared_empty !== undefined
-      ) {
-        if (!t.outputWait) this.count("shared-output-blockage");
-        t.outputWait = true;
-        t.blockReason = "finite shared empty stacker output reserved/full";
-        continue;
-      }
+      // A full shared stacker may hold a future EMPTY on its tipper;
+      // it must not prevent tipping a currently accepted full bin in advance.
       t.outputWait = false;
       delete t.blockReason;
-      t.outputReserved = true;
-      h.sharedReserved++;
       t.queue.sort(
         (a, b) =>
           (this.bins[a].fruitOrigin ?? 0) - (this.bins[b].fruitOrigin ?? 0) ||
@@ -1326,30 +1874,41 @@ class Hall {
         batch.tipped !== batch.bins.length ||
         t.bin !== null ||
         t.queue.length ||
-        batch.phase === "reconciled" ||
-        batch.phase === "blocked-shortfall"
+        batch.phase === "reconciled"
       )
         continue;
       if (batch.heights.length) {
+        const firstBlock = batch.phase !== "blocked-shortfall";
         batch.phase = "blocked-shortfall";
+        if (this.resumeShortfall(t, batch)) continue;
         t.blocked =
-          "realised endpoint shortfall; no finite compatible supplemental fruit";
-        this.record("batch-blocked", { batch: batch.id, reason: t.blocked });
+          "realised endpoint shortfall; waiting for physically accessible same-cohort stock";
+        if (firstBlock)
+          this.record("batch-blocked", { batch: batch.id, reason: t.blocked });
         continue;
       }
-      // A bounded cell-owned removal retains the entire realised remainder.
-      // This is not a downstream loose-tray/stack buffer or shipped production.
-      h.carryover[batch.sku] = {
-        fruit: batch.pendingFruit,
-        trayPositions: Math.ceil(batch.pendingFruit / batch.recipe.size),
-        owner: t.id,
-        sourceGroup: batch.sourceGroup,
-        recipe: batch.recipe.version,
-      };
-      if (batch.pendingFruit >= 40 * batch.recipe.size) {
+      // User-authorised separate labelled stock frees the cell, but fruit is
+      // neither shipped nor packed here. Keep a finite per-SKU warehouse bound.
+      if (!this.storeRemainder(batch)) {
         batch.phase = "blocked-carryover-capacity";
-        t.blocked = "finite cell-side 40-tray carryover capacity exceeded";
+        t.blocked =
+          "finite labelled remainder store 40-tray per-SKU capacity exceeded";
         continue;
+      }
+      t.blocked = null;
+      if (
+        batch.realisedClosure ||
+        batch.ageClearance ||
+        batch.finiteStockResumption
+      ) {
+        batch.goalLayers = batch.layers;
+        batch.partialPallet = batch.currentPallet?.layers
+          ? {
+              ...batch.currentPallet,
+              boundary:
+                "incomplete pallet retained; not counted as completed output",
+            }
+          : null;
       }
       batch.phase = "reconciled";
       batch.reconciliation = {
@@ -1358,6 +1917,8 @@ class Hall {
         carryover: batch.pendingFruit,
         rejects: batch.rejects,
       };
+      for (const [lane, owner] of Object.entries(h.fifoLaneOwners))
+        if (owner === batch.id) delete h.fifoLaneOwners[lane];
       delete h.skuOwners[batch.sku];
       t.phase = "changeover";
       this.schedule(
@@ -1421,11 +1982,10 @@ class Hall {
     }
     return false;
   }
-  refillLocal(robot) {
+  localEmptyDestination() {
     const h = this.hall;
-    if (!this.localNeedsRefill()) return false;
     const slots = this.input.network.storage_slots.low_staging;
-    const target = h.localEmpty.slots
+    return h.localEmpty.slots
       .map((i) => slots[i])
       .filter(
         (slot) =>
@@ -1442,16 +2002,24 @@ class Hall {
               (h.stores.low_staging[front.slot] ?? []).length,
           ),
       );
+  }
+  refillLocal(robot) {
+    const h = this.hall;
+    if (!this.localNeedsRefill()) return false;
+    const target = this.localEmptyDestination();
     if (!target) return false;
     const meta = {
       kind: "local-empty",
       destinationStore: "low_staging",
       destinationSlot: target.slot,
     };
-    if (h.shared.length === 3 && this.leases.shared_empty === undefined)
+    if (
+      this.sharedPickupStack().length === 3 &&
+      this.leases.shared_empty === undefined
+    )
       return this.missionHall(
         robot,
-        [...h.shared],
+        this.sharedPickupStack(),
         "shared_empty",
         target.dropoff_node,
         meta,
@@ -1489,6 +2057,61 @@ class Hall {
           return true;
     return false;
   }
+  drainSharedPickup(robot) {
+    const h = this.hall;
+    if (this.leases.shared_empty !== undefined) return false;
+    const bins = this.sharedPickupStack();
+    // The physical common stacker releases complete three-bin stacks only.
+    // Single-filler supply is taken from local storage after whole-stack delivery.
+    if (bins.length !== 3) {
+      h.sharedPickupBlocked =
+        h.sharedInternalCapacity && bins.length
+          ? "incomplete common output stack; requires three bins, single/pair pickup forbidden"
+          : null;
+      return false;
+    }
+    h.sharedPickupBlocked = null;
+    const local = this.localEmptyStatus();
+    if (
+      local.assigned - local.outbound + local.inbound + bins.length <=
+      local.target
+    ) {
+      const slot = this.localEmptyDestination();
+      if (
+        slot &&
+        this.missionHall(robot, bins, "shared_empty", slot.dropoff_node, {
+          kind: "local-empty",
+          destinationStore: "low_staging",
+          destinationSlot: slot.slot,
+        })
+      )
+        return true;
+    }
+    const feederCount = h.feeder.flat().length;
+    if (
+      bins.length === 3 &&
+      feederCount + h.feederInbound + 3 <=
+        (this.input.equipment_config.feeder_capacity ?? 9) &&
+      !h.feeder[0].length &&
+      !h.feederMoving[0] &&
+      !h.feederInbound &&
+      this.missionHall(robot, bins, "shared_empty", "grader_empty_drop", {
+        kind: "feeder",
+      })
+    )
+      return true;
+    // User-authorised overflow uses only mapped top-right empty storage, never
+    // invented capacity or one overloaded AGV carrying both output stacks.
+    const slot = this.storageDestination("empty_staging", bins, true);
+    return (
+      !!slot &&
+      this.missionHall(robot, bins, "shared_empty", slot.dropoff_node, {
+        kind: "empty-store",
+        destinationStore: "empty_staging",
+        destinationSlot: slot.slot,
+      })
+    );
+  }
   dispatch(triggers) {
     this.hall.compute.dispatches++;
     this.decisions.push({ time: this.time, triggers });
@@ -1500,38 +2123,43 @@ class Hall {
     const h = this.hall;
     // Generate actual tasks, then missionHall pairs each with a feasible robot.
     // Charging is admitted before productive pairing, never during a rejected probe.
-    for (const robot of this.robots)
+    const projectedSoc = (robot) =>
+      robot.soc -
+      (robot.power_kw * (this.time - robot.energy_time)) /
+        3600 /
+        robot.usable_kwh;
+    for (const robot of [...this.robots].sort(
+      (a, b) => projectedSoc(a) - projectedSoc(b) || a.id.localeCompare(b.id),
+    ))
       if (robot.job === null) chargeIdle(this, robot);
     for (const robot of this.robots) {
       if (!this.robots.some((r) => r.job === null)) break;
-      let assigned = false;
+      let assigned = this.drainSharedPickup(robot);
+      if (assigned) continue;
       // Direct needed empties precede storage; finite bottom refill counts
       // assigned/inbound, while usable stock is projected separately.
       const vacant = this.machines.find(
         (m) =>
           !m.assignment && m.bin === null && this.leases[m.id] === undefined,
       );
-      if (vacant && h.shared.length && this.leases.shared_empty === undefined) {
-        const i = h.shared.at(-1);
-        assigned = this.missionHall(robot, [i], "shared_empty", vacant.id, {
-          kind: "empty-low",
-        });
-      }
       if (!assigned && vacant)
         assigned = this.assignEmpty(robot, vacant, ["low_staging"]);
       const count = h.feeder.reduce((n, s) => n + s.length, 0);
       if (
         !assigned &&
-        count < 7 &&
-        count + h.feederInbound < 6 &&
+        count + h.feederInbound + 3 <=
+          (this.input.equipment_config.feeder_capacity ?? 9) &&
         !h.feeder[0].length &&
         !h.feederMoving[0] &&
         !h.feederInbound
       ) {
-        if (h.shared.length === 3 && this.leases.shared_empty === undefined)
+        if (
+          this.sharedPickupStack().length === 3 &&
+          this.leases.shared_empty === undefined
+        )
           assigned = this.missionHall(
             robot,
-            [...h.shared],
+            this.sharedPickupStack(),
             "shared_empty",
             "grader_empty_drop",
             { kind: "feeder" },
@@ -1565,8 +2193,8 @@ class Hall {
         this.leases["T5:empty"] === undefined
       ) {
         if (
-          count < 7 &&
-          count + h.feederInbound < 6 &&
+          count + h.feederInbound + 3 <=
+            (this.input.equipment_config.feeder_capacity ?? 9) &&
           !h.feeder[0].length &&
           !h.feederMoving[0] &&
           !h.feederInbound
@@ -1601,7 +2229,7 @@ class Hall {
         !h.t5.inbound &&
         this.leases.T5 === undefined
       ) {
-        for (const sku of ["SKU01", "SKU05", "SKU06"]) {
+        for (const sku of T5_SKUS) {
           const stock = this.freeStock(sku).filter(
             (i) => this.accessible(i) && h.stores[this.bins[i].location],
           );
@@ -1668,9 +2296,39 @@ class Hall {
         if (!transport) continue;
         const first = transport.bins[0],
           b = this.bins[first];
+        if (b.location !== "wall_storage") {
+          const destination = this.fifoDestination(transport.bins);
+          if (
+            destination &&
+            this.missionHall(
+              robot,
+              transport.bins,
+              this.source(first),
+              destination.dropoff_node,
+              {
+                kind: "fifo-relocate",
+                sku: batch.sku,
+                store: b.location,
+                slot: b.slot,
+                destinationStore: "wall_storage",
+                destinationSlot: destination.slot,
+                batch: batch.id,
+                transportGroup: batch.transportGroups.indexOf(transport),
+              },
+            )
+          ) {
+            h.fifoLaneOwners[destination.lane] = batch.id;
+            transport.job = this.jobs.at(-1).id;
+            transport.status = "relocating-to-FIFO";
+            assigned = true;
+            break;
+          }
+          continue;
+        }
         if (
           this.missionHall(robot, transport.bins, this.source(first), t.id, {
             kind: "full-tip",
+            sku: batch.sku,
             store: h.stores[b.location] ? b.location : null,
             slot: b.slot,
             tipper: t.id,
@@ -1712,9 +2370,14 @@ class Hall {
           })
         )
           continue;
+        const putawayStores = HIGH_VOLUME_SKUS.includes(source.sku)
+          ? this.overflowReason(bins)
+            ? ["wall_storage", "low_staging"]
+            : ["wall_storage"]
+          : ["low_staging"];
         const partialStore =
           bins.length === 1
-            ? h.fullPutawayStores.find((store) =>
+            ? putawayStores.find((store) =>
                 Object.values(h.stores[store]).some(
                   (stack) =>
                     stack.length > 0 &&
@@ -1731,15 +2394,14 @@ class Hall {
                 ),
               )
             : null;
-        for (const store of partialStore
-          ? [partialStore]
-          : h.fullPutawayStores) {
+        for (const store of partialStore ? [partialStore] : putawayStores) {
           const slot = this.storageDestination(store, bins, true);
           if (
             slot &&
-            this.allowFifoLane(slot, source) &&
+            (store !== "wall_storage" || this.allowFifoLane(slot, source)) &&
             this.missionHall(robot, bins, m.id, slot.dropoff_node, {
               kind: "full-store",
+              sku: source.sku,
               destinationStore: store,
               destinationSlot: slot.slot,
             })
@@ -1752,7 +2414,10 @@ class Hall {
         m.blocked ??= "waiting for reachable compatible FIFO space/transport";
       }
       if (assigned) continue;
-      if (h.shared.length === 3 && this.leases.shared_empty === undefined) {
+      if (
+        this.sharedPickupStack().length === 3 &&
+        this.leases.shared_empty === undefined
+      ) {
         const slots = this.input.network.storage_slots.empty_staging;
         for (const slot of [...slots].sort(
           (a, b) => b.depth - a.depth || a.lane - b.lane,
@@ -1774,7 +2439,7 @@ class Hall {
           if (
             this.missionHall(
               robot,
-              [...h.shared],
+              this.sharedPickupStack(),
               "shared_empty",
               slot.dropoff_node,
               {
@@ -1872,6 +2537,8 @@ class Hall {
         ? 10000
         : 0;
       return (
+        (this.agedCohort(b.sku, [i]) && RECIPES[b.sku] ? 30000 : 0) +
+        (PREPACK_SKUS.includes(b.sku) ? 20000 : 0) +
         active +
         (m.assignment ? 1000 : 0) +
         this.bins.filter(
@@ -1900,6 +2567,7 @@ class Hall {
     if (existing.length) return true;
     const owners = [
       ...new Set([
+        ...PREPACK_SKUS,
         ...Object.values(this.hall.tipperAssignments ?? {}),
         ...this.machines
           .filter((m) => m.assignment && RECIPES[m.assignment])
@@ -1907,6 +2575,13 @@ class Hall {
       ]),
     ];
     if (owners.includes(source.sku)) return true;
+    // A triggered aged cohort now has a real reduced-run consumer. Let it use
+    // a physically vacant lane; never relocate or mix existing lane stock.
+    if (
+      RECIPES[source.sku] &&
+      this.agedCohort(source.sku, [this.bins.indexOf(source)])
+    )
+      return true;
     const occupiedOther = new Set(
       slots
         .filter((s) =>
@@ -1935,18 +2610,66 @@ class Hall {
       };
       return false;
     }
-    // A spare lane goes to a supported packable recipe, never an external-only
-    // prepack singleton that has no configured route out of this finite system.
+    // Prepack has protected collection capacity above; other spare lanes go to
+    // supported recipes or the existing T5 carton streams.
     return (
       !!RECIPES[source.sku] || ["SKU01", "SKU05", "SKU06"].includes(source.sku)
     );
   }
+  overflowReason(bins) {
+    if (
+      !bins.length ||
+      !bins.every((i) => HIGH_VOLUME_SKUS.includes(this.bins[i].sku))
+    )
+      return null;
+    // Ignore temporary lane leases: a busy reachable FIFO slot is a reason to
+    // wait, not to fragment a cohort across left overflow storage.
+    return this.fifoDestination(bins, true)
+      ? null
+      : "no-physically-reachable-compatible-FIFO-position";
+  }
   missionHall(robot, bins, source, destination, meta) {
     bins = [...bins].sort((a, b) => this.bins[a].tier - this.bins[b].tier);
-    if (meta.kind === "full-store" && meta.destinationStore !== "wall_storage")
+    if (source === "shared_empty") {
+      const stack = this.sharedPickupStack();
+      if (meta.kind === "empty-low" || bins.length !== 3 || stack.length !== 3)
+        return false;
+      if (
+        bins.length > 3 ||
+        stack.slice(-bins.length).some((i) => !bins.includes(i)) ||
+        bins.some((i) => !stack.includes(i))
+      )
+        return false;
+    }
+    if (
+      meta.kind === "full-store" &&
+      meta.destinationStore !== "wall_storage"
+    ) {
+      if (meta.destinationStore !== "low_staging") return false;
+      const highVolume = HIGH_VOLUME_SKUS.includes(this.bins[bins[0]].sku);
+      const reason = highVolume ? this.overflowReason(bins) : null;
+      if (highVolume && !reason) return false;
+      const target = this.storageDestination("low_staging", bins, true);
+      if (!target || target.slot !== meta.destinationSlot) return false;
+      meta = {
+        ...meta,
+        sku: this.bins[bins[0]].sku,
+        slowAccumulation: !highVolume,
+        fifoOverflow: highVolume,
+        fifoOverflowReason: reason,
+      };
+    }
+    if (
+      meta.kind === "full-tip" &&
+      this.bins[bins[0]].location !== "wall_storage"
+    )
       return false;
-    if (meta.store === "wall_storage" && bins.some((i) => !this.accessible(i)))
+    if (
+      meta.kind === "fifo-relocate" &&
+      (meta.destinationStore !== "wall_storage" || meta.store !== "low_staging")
+    )
       return false;
+    if (meta.store && bins.some((i) => !this.accessible(i))) return false;
     if (
       meta.destinationStore === "wall_storage" &&
       this.planningIndex.putawayFronts.wall_storage[meta.destinationSlot].some(
@@ -2100,6 +2823,7 @@ class Hall {
       } else if (
         meta.kind === "empty-store" ||
         meta.kind === "full-store" ||
+        meta.kind === "fifo-relocate" ||
         meta.kind === "local-empty"
       ) {
         const previous =
@@ -2114,8 +2838,19 @@ class Hall {
           b.owner = meta.destinationStore;
           b.slot = meta.destinationSlot;
           b.tier = previous.length + job.bins.indexOf(i) + 1;
-          b.phase = meta.kind === "full-store" ? "full-ready" : "empty-ready";
-          if (meta.kind === "full-store") b.fifoEnteredAt = this.time;
+          b.phase = ["full-store", "fifo-relocate"].includes(meta.kind)
+            ? "full-ready"
+            : "empty-ready";
+          if (["full-store", "fifo-relocate"].includes(meta.kind))
+            b.fifoEnteredAt = this.time;
+        }
+        if (meta.kind === "fifo-relocate") {
+          const group = h.runs[meta.batch].transportGroups[meta.transportGroup];
+          group.source = meta.destinationStore;
+          group.slot = meta.destinationSlot;
+          group.job = null;
+          group.status = "FIFO-ready";
+          this.count("fifo-relocated", job.bins.length);
         }
         if (meta.kind === "local-empty") {
           h.localEmpty.inbound -= job.bins.length;
@@ -2228,7 +2963,7 @@ class Hall {
         station: "shared_empty",
         kind: "pickup",
         status: this.leases.shared_empty !== undefined ? "assigned" : "waiting",
-        reason: `${h.shared.length}/3 stationary; ${h.sharedInbound} inbound`,
+        reason: `${this.sharedPickupStack().length}/3 pickup; ${h.shared.length}/${h.sharedCapacity} outputs${h.sharedInternalCapacity ? `; ${h.sharedInternal.length}/${h.sharedInternalCapacity} internal` : ""}; ${h.sharedInbound} inbound`,
       });
     for (const j of this.jobs)
       if (j.status === "active")
@@ -2325,8 +3060,16 @@ class Hall {
     s.hall = clone(h);
     s.hall.production = {
       tippedFruit: h.counts.packing ?? 0,
+      storedRemainderFruit: h.remainderStore.inventoryFruit,
+      storedRemainderMassKg: h.remainderStore.inventoryMassKg,
       packedFruit: h.runs.reduce(
         (n, batch) => n + batch.layers * 8 * batch.recipe.size,
+        0,
+      ),
+      partialPallets: h.runs.filter((batch) => batch.partialPallet?.layers > 0)
+        .length,
+      partialPalletLayers: h.runs.reduce(
+        (n, batch) => n + (batch.partialPallet?.layers ?? 0),
         0,
       ),
       completedPallets: h.runs.reduce(
@@ -2340,7 +3083,7 @@ class Hall {
       chargesCompleted: h.counts["charge-complete"] ?? 0,
     };
     s.hall.carryoverBoundary =
-      "At most 40 occupied tray positions per cell; cell-owned, no downstream loose-tray buffer; incompatible changeover blocked pending physical removal authority";
+      "Separate labelled remainder stock, conservative at most 40 occupied tray positions per SKU across cohorts; recalled once only for matching SKU/source-group/recipe; not packed or shipped output";
     s.hall.recipes = clone(RECIPES);
     s.hall.localEmptyStock = this.localEmptyStatus();
     s.tippers = clone(this.tippers);
@@ -2354,9 +3097,9 @@ class Hall {
         h.feederMoving[2] || h.destackerUntil > this.time
           ? 0
           : h.feeder[2].length,
-      objective: 6,
-      priorityBelow: 7,
-      capacity: 9,
+      objective: this.input.equipment_config.feeder_capacity ?? 9,
+      priorityBelow: this.input.equipment_config.feeder_capacity ?? 9,
+      capacity: this.input.equipment_config.feeder_capacity ?? 9,
     };
     return s;
   }

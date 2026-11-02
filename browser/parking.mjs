@@ -2,7 +2,7 @@ import { Navigation } from "./navigation.mjs";
 import { phaseEnergy } from "./energy.mjs";
 // User-designated region LEFT OF T5. These explicit finite empty-vehicle bays and
 // parking-only links are provisional configuration, NOT surveyed site geometry.
-// They add no bin positions and do not change the single C1 charging capacity.
+// They add no bin positions. Additional chargers use existing remote bays.
 export function installParking(run) {
   const network = run.input.network,
     anchor = "xy:52.50000,-3.90395";
@@ -87,8 +87,21 @@ export function installParking(run) {
       status: "provisional user-designated idle bay; not a charger",
     });
   }
-  // Two provisional staging bays above/left of the low fillers. These are
-  // idle parking only: C1 and its approach/charging capacity remain unchanged.
+  // User permits four chargers. C1 is retained; existing remote P1-P3 bays
+  // become independent charge points, not extra overlapping vehicle positions.
+  const chargerCount = run.input.energy.charger_count?.value ?? 1;
+  for (let i = run.input.chargers.length; i < chargerCount; i++) {
+    const bay = bays[i - 1];
+    if (!bay) throw Error("Insufficient remote bays for configured chargers");
+    const charger = structuredClone(run.input.chargers[0]);
+    charger.id = bay.id;
+    charger.fork_heading.value = 270;
+    run.input.chargers.push(charger);
+    bay.charger = true;
+    bay.status =
+      "user-assumed remote charger; provisional existing bay geometry";
+  }
+  // Two upper-left staging bays remain parking only.
   const fillerAnchor = "xy:-8.46261,26.32305";
   if (!network.nodes[fillerAnchor])
     throw Error("Upper-left filler junction missing");
@@ -179,16 +192,17 @@ export function returnIdleHome(run, robot) {
   if (
     robot.job !== null ||
     robot.carried !== null ||
-    run.hall.parking.bays.some((b) => b.id === robot.location)
+    run.hall.parking.bays.some((b) => b.id === robot.location && !b.charger)
   )
     return false;
   const parking = run.hall.parking;
   // Stage near the completed work, not at a permanent remote home. Both finite
-  // upper-left bays remain available to any AGV; C1 is still the only charger.
+  // upper-left bays remain available to any AGV; charger bays are not idle bays.
   const point = run.input.network.nodes[robot.location];
   const candidates = parking.bays
     .filter(
       (bay) =>
+        !bay.charger &&
         (!parking.occupancy[bay.id] ||
           parking.occupancy[bay.id] === robot.id) &&
         run.leases[`parking:${bay.id}`] === undefined,

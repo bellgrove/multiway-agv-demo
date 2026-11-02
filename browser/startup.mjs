@@ -152,13 +152,13 @@ export function seedWorkingStartup(run) {
     const i = stack.pop(),
       b = run.bins[i];
     Object.assign(b, {
-      location: "shared_empty",
-      owner: "shared_empty",
+      location: h.sharedInternalCapacity ? "shared_internal" : "shared_empty",
+      owner: h.sharedInternalCapacity ? "shared_internal" : "shared_empty",
       slot: 0,
       tier,
       origin: "shared_empty",
     });
-    h.shared.push(i);
+    (h.sharedInternalCapacity ? h.sharedInternal : h.shared).push(i);
   }
   h.startup = "preloaded-working-FIFO-two-SKU-v1";
   h.tipperAssignments = { T1: "SKU23", T2: "SKU24" };

@@ -1,9 +1,9 @@
 import { phaseEnergy } from "./energy.mjs";
 // Finite single-charger recovery. Idle threshold wakes are predicted events,
 // never fruit/frame polling. Power and geometry remain the cited input values.
-const threshold = 0.45,
-  target = 0.85;
+const chargeThreshold = (run) => run.input.energy.charge_trigger_soc.value;
 export function scheduleBatteryWake(run, robot) {
+  const threshold = chargeThreshold(run);
   robot.batteryWake = (robot.batteryWake ?? 0) + 1;
   if (robot.job !== null) return;
   const available =
@@ -25,13 +25,20 @@ export function scheduleBatteryWake(run, robot) {
     );
 }
 export function chargeIdle(run, robot) {
+  const threshold = chargeThreshold(run),
+    target = run.input.energy.charge_target_soc.value;
   const available =
     robot.soc * robot.usable_kwh -
     (robot.power_kw * (run.time - robot.energy_time)) / 3600;
   if (available / robot.usable_kwh > threshold + 1e-9) return false;
   if (robot.carried !== null) return false;
   const charger = run.input.chargers.find(
-    (c) => run.leases[`charger:${c.id}`] === undefined,
+    (c) =>
+      run.leases[`charger:${c.id}`] === undefined &&
+      run.leases[`parking:${c.id}`] === undefined &&
+      !run.robots.some(
+        (r) => r !== robot && r.location === c.id && r.job === null,
+      ),
   );
   if (!charger) return true; // Wait for the actual release event, no fake capacity.
   const phases = run.navigation.plan(
@@ -53,9 +60,11 @@ export function chargeIdle(run, robot) {
   }
   const arrival = phases.at(-1)?.end ?? run.time;
   const auxiliary = run.input.energy.auxiliary_power.value;
+  const batteryPower =
+    charger.power.value * run.input.energy.charge_efficiency.value;
   const duration =
     ((target * robot.usable_kwh - available + travelEnergy) /
-      (charger.power.value - auxiliary)) *
+      (batteryPower - auxiliary)) *
     3600;
   if (!(duration > 0 && Number.isFinite(duration)))
     throw Error("Invalid charger net power/duration");
@@ -79,7 +88,8 @@ export function chargeIdle(run, robot) {
     leaseKeys: [`charger:${charger.id}`],
     meta: {
       kind: "charge",
-      suppliedKwh: (charger.power.value * duration) / 3600,
+      suppliedKwh: (batteryPower * duration) / 3600,
+      gridKwh: (charger.power.value * duration) / 3600,
     },
   };
   run.jobs.push(job);
