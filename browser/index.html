@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width"
+  /><title>Packing hall · browser circulation demo</title>
+  <link rel="stylesheet" href="../playback.css" />
+  <header>
+    <h1>Packing hall <small>browser-owned low-volume demo</small></h1>
+    <span id="status">Loading local Worker…</span>
+  </header>
+  <div class="notice">
+    NAMED BOUNDED EQUIPMENT DEMO · Provisional reviewed geometry/timing. 166
+    real bins, four robot records; only L01/L02 and compatible T1 circulate. Not
+    normal production batch admission, full hall, production default or a
+    production performance pass. Initial 19,323 legacy fruit explicitly removed;
+    FIFO is empty.
+  </div>
+  <nav>
+    <button id="play" disabled>Play</button
+    ><button id="step" disabled>Step event</button
+    ><label
+      >Speed
+      <select id="speed">
+        <option>1</option>
+        <option>10</option>
+        <option selected>60</option>
+        <option>600</option>
+      </select>
+      ×</label
+    ><button id="fit">Fit plan</button><output id="clock"></output>
+  </nav>
+  <main>
+    <section>
+      <svg
+        id="plan"
+        role="img"
+        aria-label="Interactive browser-owned packing hall"
+        viewBox="-16 -36 100 48"
+      >
+        <g id="world"></g>
+      </svg>
+      <div class="legend">
+        Same retained motion / bin glyph rules: yellow = physically present
+        fruit; outline diamonds = real robots; dashed paths = directed permitted
+        network. P↓ = outstanding pickup; D↑ = outstanding delivery; red =
+        blocked. Click a bin, robot or request station to inspect. Drag to pan;
+        wheel to zoom.
+      </div>
+      <div id="fleet"></div>
+    </section>
+    <aside>
+      <h2>Inspect</h2>
+      <label
+        >Object
+        <select id="objects"></select
+      ></label>
+      <pre id="inspect">Select a persistent bin, robot or station.</pre>
+      <h2>Run health & metrics</h2>
+      <pre id="metrics"></pre>
+      <details>
+        <summary>Recent decisions / station events</summary>
+        <pre id="events"></pre>
+      </details>
+      <details>
+        <summary>Evidence & retained limitations</summary>
+        <p>
+          Dedicated module Worker, local two-buffer presentation. No server-side
+          world or API. Static loading only; offline continuation after assets
+          load. Output is counted as equipment-tip consumption, not conforming
+          placements or a recipe-valid batch. Full
+          feeder/high-volume/batch/charging recovery are later slices.
+        </p>
+      </details>
+    </aside>
+  </main>
+  <script src="../motion.js"></script>
+  <script type="module" src="./page.mjs"></script>
+</html>

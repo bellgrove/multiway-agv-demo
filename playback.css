@@ -1,0 +1,172 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color: #e4ecf1;
+  background: #101920;
+}
+body {
+  margin: 0;
+}
+header,
+nav,
+.timeline {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 18px;
+  flex-wrap: wrap;
+}
+h1 {
+  font-size: 22px;
+  margin: 0;
+}
+small {
+  font-size: 13px;
+  color: #90aaba;
+}
+#status {
+  margin-left: auto;
+}
+.notice {
+  padding: 8px 18px;
+  background: #493d20;
+  color: #ffe4a3;
+  font-size: 12px;
+}
+button,
+select,
+input {
+  background: #233440;
+  color: #edf5fa;
+  border: 1px solid #6d8492;
+  padding: 6px;
+  border-radius: 4px;
+}
+button,
+a {
+  cursor: pointer;
+}
+a {
+  color: #9dd3ff;
+}
+input[type="number"] {
+  width: 95px;
+}
+#time {
+  flex: 1;
+}
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 350px;
+  gap: 10px;
+  padding: 10px;
+}
+section,
+aside {
+  background: #17252e;
+  border-radius: 8px;
+  padding: 10px;
+}
+#plan {
+  width: 100%;
+  height: 59vh;
+  background: #f3f1e8;
+  touch-action: none;
+  cursor: grab;
+}
+.legend {
+  font-size: 12px;
+  padding: 9px;
+}
+.full {
+  color: #ffb041;
+}
+.empty {
+  color: #7ad1ed;
+}
+h2 {
+  font-size: 16px;
+}
+aside {
+  max-height: 73vh;
+  overflow: auto;
+}
+dt {
+  color: #96b2c5;
+  font-size: 12px;
+}
+dd {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+.metric {
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid #31434f;
+  padding: 5px;
+  font-size: 12px;
+}
+.vehicle {
+  cursor: pointer;
+}
+.label {
+  font-size: 0.65px;
+  fill: #10232b;
+  paint-order: stroke;
+  stroke: #f3f1e8;
+  stroke-width: 0.13px;
+}
+.stack {
+  cursor: pointer;
+}
+.selected {
+  stroke: #ed225c !important;
+  stroke-width: 0.18 !important;
+}
+#fleet {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+#fleet button {
+  font-size: 11px;
+}
+#events p {
+  font-size: 12px;
+}
+.bad {
+  color: #ffad97;
+}
+details {
+  margin-top: 16px;
+}
+@media (max-width: 900px) {
+  main {
+    grid-template-columns: 1fr;
+  }
+  aside {
+    max-height: none;
+  }
+  #plan {
+    height: 50vh;
+  }
+}
+
+aside select {
+  max-width: 100%;
+  width: 100%;
+}
+.metric {
+  gap: 10px;
+  align-items: start;
+}
+.metric span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.metric span:last-child {
+  max-width: 60%;
+  text-align: right;
+}
+aside label {
+  display: block;
+}

@@ -1,0 +1,16 @@
+{
+  "source_commit": "cd9adb86841d40805399e79bce2743db99dbfb10",
+  "published_files": [
+    "playback.css",
+    "motion.js",
+    "browser/index.html",
+    "browser/page.mjs",
+    "browser/worker.mjs",
+    "browser/experiment.mjs",
+    "browser/navigation.mjs",
+    "browser/energy.mjs",
+    "browser/demo-input.json"
+  ],
+  "variant": "browser-owned bounded low-volume circulation",
+  "published_date": "2026-11-02"
+}
