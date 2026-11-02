@@ -1,16 +1,20 @@
 {
-  "source_commit": "cd9adb86841d40805399e79bce2743db99dbfb10",
-  "published_files": [
-    "playback.css",
-    "motion.js",
-    "browser/index.html",
-    "browser/page.mjs",
-    "browser/worker.mjs",
-    "browser/experiment.mjs",
-    "browser/navigation.mjs",
-    "browser/energy.mjs",
-    "browser/demo-input.json"
-  ],
-  "variant": "browser-owned bounded low-volume circulation",
-  "published_date": "2026-11-02"
+  "source_commit": "deffadbf3a7945a5b123c988b816820760971d36",
+  "variant": "browser-owned mixed hall with physical FIFO and event-driven planning",
+  "entry": "browser/index.html?scenario=active",
+  "sha256": {
+    "playback.css": "4ffdfa03262078841412116bb8eb1a36c02cba23604a968a557f9a89795d87f6",
+    "motion.js": "436e6e0e70601baf0981a5d35a81c3dde817ca0b27ce6091a6a5dfd00bd5fe5e",
+    "browser/index.html": "1b134e3e532437185e787156063aae24a56263e32b0b259bad610fafc14d5cf3",
+    "browser/page.mjs": "b059a8cbe36544b64cd355c61772f679453eee656e8f503c79d3a352b9ec4b65",
+    "browser/worker.mjs": "4eb77b2fea304fb75fa86d6e735ae925e8535cfcf62459e9b816872782428770",
+    "browser/experiment.mjs": "c42a0f041b48c8540045d17b4eb74c6cc1d000fab56a7caa204c8c6b56e327c0",
+    "browser/navigation.mjs": "be66155d9f751d74bf5f4d52857d9ab924d21304981acce7d663e3ad37ec46ef",
+    "browser/energy.mjs": "811ed6f7c2c35ae9c020d01f0861cff612170f2e05522d5f22f69b74b8baf03b",
+    "browser/hall.mjs": "289e6008fabac14129b1dd17aac9a634e57689323895e5dbec1829d2bcd7a024",
+    "browser/parking.mjs": "8f44b9d0cbc6ca7cb888565d34ab37bf4a454a9b2410c707d5b86dd743c860ce",
+    "browser/recipes.mjs": "b4734bf086e93a37ac5563c1d6220c9c02f06be6f2f721beab353e32365ee4ea",
+    "browser/sku-catalog.mjs": "f78208efc47c2d5151020ca5a403b4d6a96952dc436fb6a397daf3437ee73005",
+    "browser/demo-input.json": "713c696ab3767b6fab8a023cdc72eda1611fe42b7d0f8d0728ae4d6df9be81b8"
+  }
 }

@@ -37,6 +37,9 @@ function choose(id) {
 }
 function initialize(m) {
   meta = m;
+  document.querySelector(".notice").textContent =
+    m.purpose +
+    " · 166 conserved bin identities / four robots. Initial 19,323 legacy fruit explicitly removed in named empty-FIFO mode; selected recipe stock is separately declared. Geometry, timings and selected recipe approvals remain provisional; unsupported closure blocks.";
   // Draw static permitted edges once, never rebuild glyphs on model events.
   for (const edge of m.network.edges)
     el("polyline", {
@@ -46,7 +49,7 @@ function initialize(m) {
       "stroke-width": ".045",
       "stroke-dasharray": ".2 .2",
     });
-  for (const id of ["L01", "L02", "T1", "shared_empty"]) {
+  for (const id of m.stationIds) {
     const [x, y] = m.network.nodes[id];
     const g = el("g", {});
     el(
@@ -115,10 +118,7 @@ function initialize(m) {
     "V2",
     "V3",
     "V4",
-    "L01",
-    "L02",
-    "T1",
-    "shared_empty",
+    ...m.stationIds,
   ]) {
     const o = document.createElement("option");
     o.value = id;
@@ -142,6 +142,14 @@ worker.onmessage = ({ data: m }) => {
         s.bins.find((b) => b.id === selected) ||
         s.robots.find((r) => r.id === selected) ||
         s.machines.find((v) => v.id === selected) ||
+        s.tippers?.find((t) => t.id === selected) ||
+        (selected === "T5" ? s.hall?.t5 : null) ||
+        (selected === "low_staging" ? s.hall?.localEmptyStock : null) ||
+        s.hall?.parking?.bays.find((b) => b.id === selected) ||
+        (selected === "grader_empty_drop" ? s.hall?.feederStock : null) ||
+        (selected === "shared_empty"
+          ? { stock: s.hall?.shared, inbound: s.hall?.sharedInbound }
+          : null) ||
         s.tipper;
     if (m.request !== selected) return;
     $("inspect").textContent = JSON.stringify(
@@ -173,6 +181,13 @@ function locationPoint(b) {
   const id = meta.locations[b.location],
     slot = meta.network.storage_slots[id]?.[b.slot];
   if (slot) return slot.centre_xy_m;
+  if (id === "grader_empty_drop")
+    return meta.network.high_volume_flow.feeder_stack_positions[b.slot];
+  const high = meta.network.high_volume_flow.outlets[id];
+  if (high)
+    return high[
+      b.slot === 0 ? "stacker" : b.slot === 1 ? "filler" : "queued_empty"
+    ];
   const station = meta.network.stations[id];
   if (station) {
     const origin = meta.network.nodes[id],
@@ -212,14 +227,18 @@ function draw(m) {
     );
   const moving = new Map(m.conveyors.map((c) => [c.bin, c]));
   meta.bins.forEach((b, i) => {
-    const offset = i * 8,
+    const offset = i * meta.binStride,
       location = a[offset],
       slot = a[offset + 1],
       tier = a[offset + 2],
       count = a[offset + 3],
       phase = meta.phases[a[offset + 5]],
-      mass = a[offset + 7];
-    const carrier = m.robots.findIndex((r) => r.carried === i),
+      mass = a[offset + 7],
+      sku = meta.skus[a[offset + 8]]?.id,
+      target = a[offset + 9];
+    const carrier = m.robots.findIndex(
+        (r) => r.carried === i || r.carriedBins?.includes(i),
+      ),
       conveyor = moving.get(i);
     let position =
       carrier >= 0
@@ -227,18 +246,21 @@ function draw(m) {
         : conveyor
           ? TracePresentation.conveyorPose(conveyor, m.time).position_m
           : locationPoint({ location, slot });
-    if (meta.locations[location] === "T1" && !conveyor)
-      position = meta.network.tipper_flow.tippers.T1.tip;
+    if (meta.network.tipper_flow.tippers[meta.locations[location]] && !conveyor)
+      position =
+        meta.network.tipper_flow.tippers[meta.locations[location]][
+          phase === "tip-queued" ? "dropoff" : "tip"
+        ];
     const glyph = TracePresentation.binGlyph(
       [
         {
           id: b.id,
           tier: 1,
-          sku: count ? "SKU02" : null,
+          sku: count ? sku : null,
           fruit_count: count,
           fruit_mass_kg: mass,
           phase,
-          fill_count_target: 952,
+          fill_count_target: target,
         },
       ],
       400,
@@ -279,7 +301,13 @@ function draw(m) {
   $("clock").textContent =
     `Displayed ${m.time.toFixed(2)} s · frontier ${m.frontier.toFixed(2)} s`;
   $("metrics").textContent = JSON.stringify(
-    { accounting: m.accounting, workerMs: m.timings, drawMs, draws },
+    {
+      hall: m.hall,
+      accounting: m.accounting,
+      workerMs: m.timings,
+      drawMs,
+      draws,
+    },
     null,
     2,
   );
@@ -293,6 +321,7 @@ function draw(m) {
   window.browserDemo.frame = frame;
   drawMs += performance.now() - started;
   draws++;
+  window.browserDemo.renderTimings = { drawMs, draws };
   recycle(m.buffer, m.bufferId);
 }
 function render() {
@@ -346,5 +375,13 @@ window.browserDemo = {
   inspection: null,
   error: null,
 };
-command("init");
+const scenario =
+  new URLSearchParams(location.search).get("scenario") || "mixed";
+$("scenario").value = scenario;
+$("scenario").onchange = () => {
+  const url = new URL(location.href);
+  url.searchParams.set("scenario", $("scenario").value);
+  location.href = url;
+};
+command("init", { scenario });
 requestAnimationFrame(render);

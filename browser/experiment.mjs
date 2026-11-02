@@ -1,3 +1,4 @@
+import { initializeHall } from "./hall.mjs";
 import { phaseEnergy } from "./energy.mjs";
 import { Navigation } from "./navigation.mjs";
 const copy = (value) => structuredClone(value);
@@ -82,7 +83,10 @@ export class Experiment {
     )
       throw Error("Invalid finite grader/conveyor configuration");
     this.input = copy(input);
-    this.navigation = new Navigation(input.network, input.handling);
+    this.navigation =
+      options.mode === "mixed"
+        ? null
+        : new Navigation(input.network, input.handling);
     const sku = input.skus.find((s) => s.id === "SKU02"),
       bin = input.bins.find((b) => b.location === "L01");
     this.config = {
@@ -181,6 +185,7 @@ export class Experiment {
     // Only event times are initialized here: no future outcomes are computed.
     this.schedule(0, "startup", {}, 1);
     if (this.config.fruitCount) this.schedule(0, "fresh", { number: 0 });
+    if (options.mode === "mixed") initializeHall(this, options);
   }
   schedule(time, kind, data = {}, priority = 0) {
     if (time < this.time - 1e-9) throw Error("Past event");
@@ -542,14 +547,18 @@ export class Experiment {
       return;
     }
   }
-  mission(robot, bin, source, destination) {
+  mission(robot, bin, source, destination, options = {}) {
     const phases = this.navigation.plan(
       robot,
       source,
       destination,
       this.time,
       this.calendar,
-      { emptyPickup: this.bins[bin].sku === null },
+      {
+        emptyPickup: this.bins[bin].sku === null,
+        pickupTier: this.bins[bin].tier,
+        dropTier: options.dropTier ?? 1,
+      },
     );
     const energy = phaseEnergy(phases, this.bins[bin], this.input.energy);
     const vehicle = this.input.vehicles[this.robots.indexOf(robot)];

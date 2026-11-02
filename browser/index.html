@@ -3,20 +3,30 @@
   <meta charset="utf-8" /><meta
     name="viewport"
     content="width=device-width"
-  /><title>Packing hall · browser circulation demo</title>
+  /><title>Packing hall · browser mixed hall</title>
   <link rel="stylesheet" href="../playback.css" />
   <header>
-    <h1>Packing hall <small>browser-owned low-volume demo</small></h1>
+    <h1>Packing hall <small>browser-owned mixed-grade hall</small></h1>
     <span id="status">Loading local Worker…</span>
   </header>
   <div class="notice">
-    NAMED BOUNDED EQUIPMENT DEMO · Provisional reviewed geometry/timing. 166
-    real bins, four robot records; only L01/L02 and compatible T1 circulate. Not
-    normal production batch admission, full hall, production default or a
-    production performance pass. Initial 19,323 legacy fruit explicitly removed;
-    FIFO is empty.
+    NAMED MIXED HALL · Provisional reviewed geometry/timing. 166 real bins, four
+    enabled robots, ten fixed high outlets, 23 low fillers, finite feeder and
+    four tray tippers/shared empty stacker. Selected fixed-count recipes are
+    sampled, not operationally approved. Unsupported closure modes block.
+    Empty-FIFO startup explicitly removes 19,323 legacy fruit. Not a production
+    default or Ben-computer performance certification.
   </div>
   <nav>
+    <label
+      >Scenario
+      <select id="scenario">
+        <option value="mixed">Mixed empty-FIFO</option>
+        <option value="active">Cited recipe-valid active stock</option>
+        <option value="boundary">T5 / offsite boundary witness</option>
+        <option value="circulation">Single-low circulation witness</option>
+      </select></label
+    >
     <button id="play" disabled>Play</button
     ><button id="step" disabled>Step event</button
     ><label
@@ -67,9 +77,12 @@
         <p>
           Dedicated module Worker, local two-buffer presentation. No server-side
           world or API. Static loading only; offline continuation after assets
-          load. Output is counted as equipment-tip consumption, not conforming
-          placements or a recipe-valid batch. Full
-          feeder/high-volume/batch/charging recovery are later slices.
+          load. Raw tipped counts are distinct from complete eight-stack
+          transfers and cell-owned carryover. No unlimited supplemental fruit or
+          downstream loose-tray buffer. Weekend, mixed-pallet dispatch,
+          calibrated geometric approval and broader Monte Carlo review remain
+          unresolved. Charging/recovery/checkpoint/default cutover belong to the
+          next slice.
         </p>
       </details>
     </aside>

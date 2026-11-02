@@ -6,6 +6,9 @@ export class Navigation {
     this.out = new Map();
     this.turns = new Map();
     this.cache = new Map();
+    this.parkingStations = new Set(
+      (network.parking?.bays ?? []).map((b) => b.id),
+    );
     for (const edge of network.edges) {
       if (!this.out.has(edge.source)) this.out.set(edge.source, []);
       this.out.get(edge.source).push(edge);
@@ -34,6 +37,9 @@ export class Navigation {
       for (const edge of this.out.get(p.node) || []) {
         if (
           edge.blocked ||
+          (edge.parking_only &&
+            !this.parkingStations.has(from) &&
+            !this.parkingStations.has(to)) ||
           !edge.allowed_load_states.includes(loaded ? "loaded" : "empty")
         )
           continue;
@@ -153,18 +159,31 @@ export class Navigation {
         { ...hold, geometry_m: [origin, position_m], motion: s.access_motion },
       );
       if (operation === "charge") return;
-      add(`${operation}_lift`, s.transfer_height_m / s.lift_speed_mps, {
+      const store = station.split("@")[0];
+      const tier =
+        operation === "pickup"
+          ? (options.pickupTier ?? 1)
+          : (options.dropTier ?? 1);
+      const stackInterface =
+        this.network.storage_slots[store] ||
+        this.network.high_volume_flow?.outlets[station] ||
+        station === "shared_empty" ||
+        station === "T5:empty";
+      const height =
+        s.transfer_height_m +
+        (stackInterface ? Math.max(0, tier - 1) * 0.78 : 0);
+      add(`${operation}_lift`, height / s.lift_speed_mps, {
         ...hold,
-        height_m: s.transfer_height_m,
+        height_m: height,
       });
       if (operation === "pickup" && options.emptyPickup)
         add("single_destack", this.handling.single_destack.value, hold);
       if (operation === "drop" && station === "low_staging")
         add("single_stack", this.handling.single_stack.value, hold);
       add(operation, s.transfer_s, hold);
-      add(`${operation}_lower`, s.transfer_height_m / s.lift_speed_mps, {
+      add(`${operation}_lower`, height / s.lift_speed_mps, {
         ...hold,
-        height_m: s.transfer_height_m,
+        height_m: height,
       });
       add(`${operation}_withdrawal`, s.withdrawal_s, {
         ...hold,
@@ -172,7 +191,9 @@ export class Navigation {
         motion: s.withdrawal_motion,
       });
     };
-    if (options.recovery) {
+    if (options.emptyOnly) {
+      travel(robot.location, destination, false);
+    } else if (options.recovery) {
       travel(robot.location, destination, false);
       handle(destination, "charge");
     } else {

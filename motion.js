@@ -1,6 +1,35 @@
 /* Read-only trace presentation. No inventory, scheduling or simulation stepping. */
 (function(root) {
   'use strict';
+  // CAD junctions can contain millimetre bridge edges almost perpendicular to
+  // their nearly collinear incoming/outgoing lanes. Keep their real phases,
+  // times, positions and reservations, but do not draw spurious quarter-turns.
+  function presentationPhases(phases) {
+    const result = phases.slice();
+    const travel = p => p.kind === 'empty_travel' || p.kind === 'loaded_travel';
+    const length = p => p.geometry_m?.slice(1).reduce((sum,b,i) =>
+      sum + Math.hypot(b[0]-p.geometry_m[i][0],b[1]-p.geometry_m[i][1]),0) ?? Infinity;
+    const delta = (a,b) => ((b-a+540)%360)-180;
+    for(let i=0;i<phases.length;i++) {
+      const before=phases[i];
+      if(!travel(before) || length(before)<=.05) continue;
+      let end=i+1, bridges=0;
+      while(end<phases.length) {
+        const next=phases[end];
+        if(next.kind==='turn') { end++; continue; }
+        if(travel(next) && length(next)<=.05) { bridges++; end++; continue; }
+        break;
+      }
+      const after=phases[end];
+      const heading=before.exit_heading_deg ?? before.entry_heading_deg;
+      const target=after?.entry_heading_deg;
+      if(!bridges || !after || !travel(after) || !Number.isFinite(heading) ||
+         !Number.isFinite(target) || Math.abs(delta(heading,target))>2) continue;
+      for(let j=i+1;j<end;j++) result[j]={...phases[j],
+        display_entry_heading_deg:heading, display_exit_heading_deg:heading};
+    }
+    return result;
+  }
   function vehiclePose(vehicle, phase, time, observedTime) {
     let position = [...vehicle.position_m], heading = vehicle.heading_deg;
     if (!phase) return {position_m:position, heading_deg:heading};
@@ -21,10 +50,11 @@
       }
     }
     if (phase.kind==='turn' || phase.kind.endsWith('_alignment')) {
-      const target=phase.exit_heading_deg ?? phase.fork_heading_deg;
+      const target=phase.display_exit_heading_deg ?? phase.exit_heading_deg ?? phase.fork_heading_deg;
+      heading=phase.display_entry_heading_deg ?? heading;
       const part=Math.max(0,Math.min(1,(time-observedTime)/(phase.end-observedTime)));
       heading=(heading+((target-heading+540)%360-180)*part+360)%360;
-    } else heading=phase.entry_heading_deg ?? phase.fork_heading_deg ?? heading;
+    } else heading=phase.display_entry_heading_deg ?? phase.entry_heading_deg ?? phase.fork_heading_deg ?? heading;
     return {position_m:position, heading_deg:heading};
   }
   const classColors={'Premium':'#167c38','Premium Export':'#167c38','Class 1':'#8742b2','Class 2':'#b44423','Class 3':'#555555','Juice':'#9a6500'};
@@ -99,7 +129,7 @@
     return [anchor[0]-(current[0]-start[0])*scale,
       anchor[1]-(current[1]-start[1])*scale,start[2]*scale,start[3]*scale];
   }
-  const api={vehiclePose,conveyorPose,binLabels,binFillState,binGlyph,pendingRequests,equipmentRequests,classColors,decodeWindow,pinchView};
+  const api={presentationPhases,vehiclePose,conveyorPose,binLabels,binFillState,binGlyph,pendingRequests,equipmentRequests,classColors,decodeWindow,pinchView};
   if(typeof module!=='undefined') module.exports=api;
   else root.TracePresentation=api;
 })(globalThis);

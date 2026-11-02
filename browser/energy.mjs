@@ -34,7 +34,7 @@ export function phaseEnergy(phases, bin, config) {
     else if (p.kind === "turn" || p.kind.endsWith("_alignment"))
       kwh += (v("turn_power") * seconds) / 3600;
     else if (!distance) kwh += (v("handling_power") * seconds) / 3600;
-    p.power_kw = (kwh * 3600) / seconds;
+    p.power_kw = seconds > 0 ? (kwh * 3600) / seconds : 0;
     total += kwh;
     if (p.kind === "pickup") loaded = true;
     if (p.kind === "drop") loaded = false;

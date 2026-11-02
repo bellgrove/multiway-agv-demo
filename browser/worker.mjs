@@ -1,3 +1,5 @@
+import "../motion.js";
+import { SKU_CATALOG } from "./sku-catalog.mjs";
 import { Experiment } from "./experiment.mjs";
 let run,
   input,
@@ -7,7 +9,7 @@ let run,
   wall = 0;
 const buffers = [],
   outstanding = new Set(),
-  binStride = 8,
+  binStride = 10,
   robotStride = 5;
 let needsFrame = false;
 let initializing = false;
@@ -16,6 +18,26 @@ let setupMs = 0,
   engineMs = 0,
   projectionMs = 0,
   frames = 0;
+const displayPhaseCache = new WeakMap();
+function displayRobots(robots) {
+  return robots.map((robot) => {
+    if (!robot.phase || robot.job === null) return robot;
+    const actual = run.jobs[robot.job]?.phases;
+    if (!actual) return robot;
+    let projected = displayPhaseCache.get(actual);
+    if (!projected) {
+      projected = TracePresentation.presentationPhases(actual);
+      displayPhaseCache.set(actual, projected);
+    }
+    const index = actual.findIndex(
+      (p) =>
+        p.start === robot.phase.start &&
+        p.end === robot.phase.end &&
+        p.kind === robot.phase.kind,
+    );
+    return index < 0 ? robot : { ...robot, phase: projected[index] };
+  });
+}
 const phases = [
   "empty-ready",
   "filling",
@@ -25,8 +47,13 @@ const phases = [
   "tipping",
   "empty",
   "inserted",
+  "tip-queued",
+  "external-prepack-processing",
 ];
-const locations = [];
+const locations = [],
+  locationIndex = new Map(),
+  skuIndex = new Map();
+const phaseIndex = new Map(phases.map((phase, i) => [phase, i]));
 function advance(until) {
   const start = performance.now();
   run.advance(until);
@@ -47,14 +74,16 @@ function publish() {
   s.bins.forEach((b, i) =>
     a.set(
       [
-        locations.indexOf(b.location),
+        locationIndex.get(b.location) ?? -1,
         b.slot,
         b.tier,
         b.fruit_count,
         b.reserved,
-        phases.indexOf(b.phase),
+        phaseIndex.get(b.phase) ?? -1,
         b.readyAt,
         b.fruit_mass_kg,
+        skuIndex.get(b.sku) ?? -1,
+        b.fill_count_target,
       ],
       i * binStride,
     ),
@@ -63,7 +92,7 @@ function publish() {
   s.robots.forEach((r, i) =>
     a.set(
       [
-        locations.indexOf(r.location),
+        locationIndex.get(r.location) ?? -1,
         r.carried ?? -1,
         r.soc,
         r.energy_kwh,
@@ -97,11 +126,45 @@ function publish() {
               s.bins.find((b) => b.id === selection) ||
               s.robots.find((r) => r.id === selection) ||
               s.machines.find((m) => m.id === selection) ||
+              s.tippers?.find((t) => t.id === selection) ||
+              (selection === "T5" ? s.hall?.t5 : null) ||
+              (selection === "low_staging" ? s.hall?.localEmptyStock : null) ||
+              s.hall?.parking?.bays.find((b) => b.id === selection) ||
+              (selection === "grader_empty_drop"
+                ? s.hall?.feederStock
+                : null) ||
+              (selection === "shared_empty"
+                ? {
+                    station: selection,
+                    stock: s.hall?.shared,
+                    inbound: s.hall?.sharedInbound,
+                  }
+                : null) ||
               s.tipper,
           }
         : null,
-      robots: s.robots,
+      robots: displayRobots(s.robots),
       tipper: s.tipper,
+      tippers: s.tippers,
+      hall: s.hall
+        ? {
+            counts: s.hall.counts,
+            compute: s.hall.compute,
+            feederStock: s.hall.feederStock,
+            shared: s.hall.shared,
+            sharedInbound: s.hall.sharedInbound,
+            sharedReserved: s.hall.sharedReserved,
+            localEmptyStock: s.hall.localEmptyStock,
+            parking: s.hall.parking,
+            runs: s.hall.runs
+              .filter((r) => r.phase !== "reconciled")
+              .concat(
+                s.hall.runs.filter((r) => r.phase === "reconciled").slice(-2),
+              ),
+            blockedModes: s.hall.blockedModes,
+            t5: s.hall.t5,
+          }
+        : null,
       machines: s.machines,
       conveyors: s.bins.flatMap((b, i) =>
         b.conveyor ? [{ bin: i, ...b.conveyor }] : [],
@@ -130,13 +193,39 @@ onmessage = async ({ data: m }) => {
       input = await (
         await fetch(new URL("./demo-input.json", import.meta.url))
       ).json();
-      run = new Experiment(input);
+      run = new Experiment(
+        input,
+        m.scenario === "active"
+          ? {
+              mode: "mixed",
+              seed: m.seed ?? 1,
+              initialStock: [
+                { sku: "SKU23", bins: 12 },
+                { sku: "SKU24", bins: 12 },
+              ],
+            }
+          : m.scenario === "boundary"
+            ? {
+                mode: "mixed",
+                seed: m.seed ?? 1,
+                trace: ["SKU05", "SKU17"],
+                fruitCount: 7902,
+              }
+            : m.scenario === "mixed"
+              ? { mode: "mixed", seed: m.seed ?? 1 }
+              : {},
+      );
+      input = run.input;
       locations.push(
         ...Object.keys(input.network.nodes),
         ...run.robots.map((r) => r.id),
       );
       for (const b of run.bins)
         if (!locations.includes(b.location)) locations.push(b.location);
+      locations.forEach((location, i) => {
+        if (!locationIndex.has(location)) locationIndex.set(location, i);
+      });
+      input.skus.forEach((sku, i) => skuIndex.set(sku.id, i));
       const size =
         (run.bins.length * binStride + run.robots.length * robotStride) * 8;
       buffers.push(
@@ -147,14 +236,24 @@ onmessage = async ({ data: m }) => {
       postMessage({
         type: "ready",
         metadata: {
-          inputId: input.id,
-          purpose: input.purpose,
+          inputId: run.hall?.startup ?? input.id,
+          machineIds: run.machines.map((m) => m.id),
+          stationIds: [
+            ...run.machines.map((m) => m.id),
+            ...input.cells.map((c) => c.id),
+            "shared_empty",
+            "grader_empty_drop",
+            "low_staging",
+            ...(input.network.parking?.bays ?? []).map((b) => b.id),
+          ],
+          binStride,
+          purpose: run.input.purpose,
           removedInitialFruit: input.removed_initial_fruit_count,
           bins: run.bins.map((b) => ({ id: b.id, origin: b.origin })),
           locations,
           phases,
           network: input.network,
-          skus: input.skus,
+          skus: input.skus.map((s) => ({ ...s, ...SKU_CATALOG[s.id] })),
         },
       });
       publish();
