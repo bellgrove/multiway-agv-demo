@@ -179,19 +179,35 @@ export function returnIdleHome(run, robot) {
   if (
     robot.job !== null ||
     robot.carried !== null ||
-    robot.location === robot.home
+    run.hall.parking.bays.some((b) => b.id === robot.location)
   )
     return false;
-  const parking = run.hall.parking,
-    occupant = parking.occupancy[robot.home];
-  if (occupant && occupant !== robot.id) {
-    robot.idleHomeBlocked = "finite idle bay occupied";
+  const parking = run.hall.parking;
+  // Stage near the completed work, not at a permanent remote home. Both finite
+  // upper-left bays remain available to any AGV; C1 is still the only charger.
+  const point = run.input.network.nodes[robot.location];
+  const candidates = parking.bays
+    .filter(
+      (bay) =>
+        (!parking.occupancy[bay.id] ||
+          parking.occupancy[bay.id] === robot.id) &&
+        run.leases[`parking:${bay.id}`] === undefined,
+    )
+    .sort(
+      (a, b) =>
+        Math.hypot(a.position_m[0] - point[0], a.position_m[1] - point[1]) -
+          Math.hypot(b.position_m[0] - point[0], b.position_m[1] - point[1]) ||
+        a.id.localeCompare(b.id),
+    );
+  const destination = candidates[0]?.id;
+  if (!destination) {
+    robot.idleHomeBlocked = "finite idle bays occupied/reserved";
     return false;
   }
   const phases = run.navigation.plan(
     robot,
     robot.location,
-    robot.home,
+    destination,
     run.time,
     run.calendar,
     { emptyOnly: true },
@@ -206,8 +222,8 @@ export function returnIdleHome(run, robot) {
   for (const charger of run.input.chargers) {
     const last = phases.at(-1),
       path = run.navigation.plan(
-        { ...robot, location: robot.home, heading_deg: last.exit_heading_deg },
-        robot.home,
+        { ...robot, location: destination, heading_deg: last.exit_heading_deg },
+        destination,
         charger.id,
         last.end,
         {},
@@ -235,10 +251,10 @@ export function returnIdleHome(run, robot) {
     bins: [],
     bin: null,
     source: robot.location,
-    destination: robot.home,
+    destination: destination,
     phases,
     status: "active",
-    leaseKeys: [`parking:${robot.home}`],
+    leaseKeys: [`parking:${destination}`],
     meta: { kind: "idle-home" },
     completionKwh: energy,
   };
@@ -265,7 +281,7 @@ export function returnIdleHome(run, robot) {
   run.schedule(phases.at(-1).end, "mission-end", { job: job.id });
   run.record("idle-home-admitted", {
     robot: robot.id,
-    destination: robot.home,
+    destination: destination,
   });
   run.count("idle-home");
   return true;

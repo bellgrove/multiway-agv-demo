@@ -1,5 +1,5 @@
 {
-  "source_commit": "d2f393d151a3e23b849c55e26ec2ff1f7d626e2d",
+  "source_commit": "59fcea83d45473e933bef6159cf7932b2a27a69b",
   "variant": "browser-owned mixed hall with physical FIFO and event-driven planning",
   "entry": "browser/index.html?scenario=working",
   "sha256": {
@@ -8,11 +8,11 @@
     "browser/index.html": "fd84c84782d7cbdf699452cad82093904becfaef4cf59cc969f70452801bb153",
     "browser/page.mjs": "ff22660412f5cfa634e6871f0c53a48222c7eb59333b8dee0f55a845742cdc22",
     "browser/worker.mjs": "412418b964e706b4a65ab2b42b1057681e5edc6487c3ad719c85cb38a815e8db",
-    "browser/experiment.mjs": "f5462cea2fc110083a340597a689bad016e7e21564c8ec20b836a46e6349d040",
+    "browser/experiment.mjs": "e98f921e04692df2b1874239b23fe2f66db5f8619e94c4d4379c40c33b0c5906",
     "browser/navigation.mjs": "be66155d9f751d74bf5f4d52857d9ab924d21304981acce7d663e3ad37ec46ef",
     "browser/energy.mjs": "811ed6f7c2c35ae9c020d01f0861cff612170f2e05522d5f22f69b74b8baf03b",
-    "browser/hall.mjs": "c3ec72ecc29c907565c2a76bca6bc42b16baf1bce8ae4e5490ce512a2151a947",
-    "browser/parking.mjs": "d0d13f95f54010d86e2f8dd4ad30b989915cf2d4c13104ef4cde2b86f722d070",
+    "browser/hall.mjs": "b7175ff518715e0094a5da3ee8e8ebd5363576bd2f1c6f4ad8706b941938c921",
+    "browser/parking.mjs": "eafe21e1cd767be59eee97e1e08ce9e9948aa9873d961d403ba7bbbaf8d45c3b",
     "browser/recipes.mjs": "b4734bf086e93a37ac5563c1d6220c9c02f06be6f2f721beab353e32365ee4ea",
     "browser/charging.mjs": "d95975d5b613d1824979577e37ac55b283e752fbcab7b265ceed004a1233305e",
     "browser/startup.mjs": "f326c63063cb546a98608390182f77a62dc529b2cc6ec7f7af8ad791938e7ba2",

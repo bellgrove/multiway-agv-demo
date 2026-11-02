@@ -305,6 +305,25 @@ class Hall {
       this.hallBase.handle(kind, d);
       return;
     }
+    if (kind === "hall-source-released") {
+      const job = this.jobs[d.job];
+      const keys = [job.source];
+      if (job.meta.store)
+        keys.push(
+          `column:${job.meta.store}:${this.input.network.storage_slots[job.meta.store][job.meta.slot].lane}`,
+        );
+      for (const key of keys) {
+        if (key === job.destination) continue;
+        if (this.leases[key] === job.id) delete this.leases[key];
+      }
+      job.sourceReleasedAt = this.time;
+      this.record("source-access-released", {
+        job: job.id,
+        source: job.source,
+      });
+      this.notify("station-source-withdrawal-complete", job.source);
+      return;
+    }
     if (kind === "mission-end") {
       const job = this.jobs[d.job];
       finishCharge(this, job);
@@ -950,11 +969,29 @@ class Hall {
       slots
         .filter((s) => s.lane === slot.lane)
         .every((s) => (cells[s.slot] ?? []).every(compatible));
+    const inbound = this.jobs.filter(
+      (j) =>
+        j.status === "active" &&
+        j.meta?.kind === "full-store" &&
+        j.meta.destinationStore === "wall_storage" &&
+        j.bins.every(compatible),
+    );
+    const matchingLanes = new Set(
+      slots
+        .filter((slot) => (cells[slot.slot] ?? []).some(compatible))
+        .map((s) => s.lane),
+    );
+    for (const j of inbound)
+      matchingLanes.add(slots[j.meta.destinationSlot].lane);
+    // A temporary lane lease must not fragment one cohort across multiple lanes.
+    const preferred = (slot) =>
+      !matchingLanes.size || matchingLanes.has(slot.lane);
     // Complete an accessible partial stack before opening a new stack.
     const partial = slots
       .filter((slot) => {
         const stack = cells[slot.slot] ?? [];
         return (
+          preferred(slot) &&
           stack.length &&
           stack.length + bins.length <= 3 &&
           stack.every((i) => this.bins[i].batch == null && compatible(i)) &&
@@ -970,7 +1007,10 @@ class Hall {
     // Load from the left entrance, up against the occupied bank to the right,
     // then work back towards that entrance. Never pass an occupied position.
     const candidates = slots
-      .filter((slot) => !cells[slot.slot]?.length && reachable(slot))
+      .filter(
+        (slot) =>
+          preferred(slot) && !cells[slot.slot]?.length && reachable(slot),
+      )
       .sort(
         (a, b) =>
           b.centre_xy_m[0] - a.centre_xy_m[0] ||
@@ -1130,6 +1170,12 @@ class Hall {
             recipe: clone(recipe),
             sourceGroup: group,
             bins,
+            sourceInventory: bins.map((i) => ({
+              bin: this.bins[i].id,
+              fifoEnteredAt: this.bins[i].fifoEnteredAt,
+              fruitOrigin: this.bins[i].fruitOrigin,
+              fruit: this.bins[i].fruit_count,
+            })),
             transportGroups: transport.map((bins) => ({
               bins,
               source: this.bins[bins[0]].location,
@@ -1452,33 +1498,12 @@ class Hall {
     this.tip();
     this.admit();
     const h = this.hall;
-    const readyFillers = this.machines.filter(
-      (m) =>
-        this.leases[m.id] === undefined &&
-        (m.assignment
-          ? m.stack.length === 3
-          : m.bin !== null && this.bins[m.bin].phase === "full-ready"),
-    );
-    const responseDistance = (robot) =>
-      readyFillers.length
-        ? Math.min(
-            ...readyFillers.map((m) =>
-              distance([
-                this.input.network.nodes[robot.location],
-                this.input.network.nodes[m.id],
-              ]),
-            ),
-          )
-        : 0;
-    for (const robot of this.robots
-      .filter((r) => r.job === null)
-      .sort(
-        (a, b) =>
-          responseDistance(a) - responseDistance(b) ||
-          (a.jobsAdmitted ?? 0) - (b.jobsAdmitted ?? 0) ||
-          a.id.localeCompare(b.id),
-      )) {
-      if (chargeIdle(this, robot)) continue;
+    // Generate actual tasks, then missionHall pairs each with a feasible robot.
+    // Charging is admitted before productive pairing, never during a rejected probe.
+    for (const robot of this.robots)
+      if (robot.job === null) chargeIdle(this, robot);
+    for (const robot of this.robots) {
+      if (!this.robots.some((r) => r.job === null)) break;
       let assigned = false;
       // Direct needed empties precede storage; finite bottom refill counts
       // assigned/inbound, while usable stock is projected separately.
@@ -1661,7 +1686,7 @@ class Hall {
       }
       if (assigned) continue;
       if (this.refillLocal(robot)) continue;
-      for (const m of this.machines) {
+      for (const m of this.putawayOrder()) {
         if (this.leases[m.id] !== undefined) continue;
         const bins = m.assignment
           ? m.stack.length === 3
@@ -1712,6 +1737,7 @@ class Hall {
           const slot = this.storageDestination(store, bins, true);
           if (
             slot &&
+            this.allowFifoLane(slot, source) &&
             this.missionHall(robot, bins, m.id, slot.dropoff_node, {
               kind: "full-store",
               destinationStore: store,
@@ -1774,6 +1800,147 @@ class Hall {
     for (const robot of this.robots)
       if (robot.job === null) returnIdleHome(this, robot);
   }
+  rankMissionRobots(bin, source, destination, meta) {
+    const point = this.input.network.nodes[source];
+    const region = (p) =>
+      p?.[0] >= 40
+        ? "right"
+        : p?.[0] < 40 && p?.[1] > 18
+          ? "upper-left"
+          : "other";
+    const desired = region(point);
+    const candidates = [];
+    for (const robot of this.robots) {
+      if (robot.job !== null || robot.carried !== null) continue;
+      let preview;
+      try {
+        preview = this.hallBase.mission(robot, bin, source, destination, {
+          preview: true,
+          dropTier: meta.destinationStore
+            ? (this.hall.stores[meta.destinationStore][meta.destinationSlot]
+                ?.length ?? 0) + 1
+            : 1,
+        });
+      } catch (e) {
+        if (
+          e.message.startsWith("No permitted") ||
+          e.message.startsWith("Unmapped station")
+        )
+          continue;
+        throw e;
+      }
+      if (!preview) continue;
+      const local = region(this.input.network.nodes[robot.location]);
+      const bay = /^(P\d+|C1)$/.test(robot.location);
+      const priority =
+        desired === "right"
+          ? bay
+            ? 0
+            : local === "right"
+              ? 1
+              : 2
+          : desired === "upper-left"
+            ? local === desired
+              ? 0
+              : 1
+            : 0;
+      const response =
+        preview.phases.find((p) => p.kind === "pickup")?.end ?? Infinity;
+      candidates.push({
+        robot,
+        priority,
+        response,
+        completion: preview.phases.at(-1).end,
+      });
+    }
+    return candidates.sort(
+      (a, b) =>
+        a.priority - b.priority ||
+        a.response - b.response ||
+        a.completion - b.completion ||
+        (a.robot.jobsAdmitted ?? 0) - (b.robot.jobsAdmitted ?? 0) ||
+        a.robot.id.localeCompare(b.robot.id),
+    );
+  }
+  putawayOrder() {
+    const h = this.hall;
+    const score = (m) => {
+      const i = m.assignment ? m.stack[0] : m.bin;
+      const b = this.bins[i];
+      if (!b) return -Infinity;
+      const active = Object.values(h.tipperAssignments ?? {}).includes(b.sku)
+        ? 10000
+        : 0;
+      return (
+        active +
+        (m.assignment ? 1000 : 0) +
+        this.bins.filter(
+          (bin) =>
+            bin.sku === b.sku &&
+            bin.phase === "full-ready" &&
+            bin.batch == null,
+        ).length /
+          (RECIPES[b.sku]?.minimum ?? Infinity) +
+        (this.time - (b.readyAt ?? this.time)) * 1e-8
+      );
+    };
+    return [...this.machines].sort(
+      (a, b) => score(b) - score(a) || a.id.localeCompare(b.id),
+    );
+  }
+  allowFifoLane(slot, source) {
+    // Working profile has eight homogeneous lanes for more than eight grades.
+    // Protect real active/fast fixed-output streams, rather than consume all
+    // eight lanes with rare singleton cohorts which cannot form a recipe.
+    if (!this.hall.startupStock) return true;
+    const slots = this.input.network.storage_slots.wall_storage;
+    const existing = slots
+      .filter((s) => s.lane === slot.lane)
+      .flatMap((s) => this.hall.stores.wall_storage[s.slot] ?? []);
+    if (existing.length) return true;
+    const owners = [
+      ...new Set([
+        ...Object.values(this.hall.tipperAssignments ?? {}),
+        ...this.machines
+          .filter((m) => m.assignment && RECIPES[m.assignment])
+          .map((m) => m.assignment),
+      ]),
+    ];
+    if (owners.includes(source.sku)) return true;
+    const occupiedOther = new Set(
+      slots
+        .filter((s) =>
+          (this.hall.stores.wall_storage[s.slot] ?? []).some(
+            (i) => !owners.includes(this.bins[i].sku),
+          ),
+        )
+        .map((s) => s.lane),
+    );
+    const pendingOther = this.jobs.filter(
+      (j) =>
+        j.status === "active" &&
+        j.meta?.kind === "full-store" &&
+        !owners.includes(this.bins[j.bin].sku),
+    );
+    for (const j of pendingOther)
+      occupiedOther.add(slots[j.meta.destinationSlot].lane);
+    if (occupiedOther.size >= Math.max(0, 8 - owners.length)) {
+      this.hall.fifoAllocation = {
+        time: this.time,
+        protectedSkus: owners,
+        spareLanes: Math.max(0, 8 - owners.length),
+        deferredSku: source.sku,
+        reason:
+          "homogeneous lane budget reserved for active and fixed recipe replenishment",
+      };
+      return false;
+    }
+    // A spare lane goes to a supported packable recipe, never an external-only
+    // prepack singleton that has no configured route out of this finite system.
+    return (
+      !!RECIPES[source.sku] || ["SKU01", "SKU05", "SKU06"].includes(source.sku)
+    );
+  }
   missionHall(robot, bins, source, destination, meta) {
     bins = [...bins].sort((a, b) => this.bins[a].tier - this.bins[b].tier);
     if (meta.kind === "full-store" && meta.destinationStore !== "wall_storage")
@@ -1803,6 +1970,14 @@ class Hall {
       bins.reduce((n, i) => n + this.bins[i].fruit_mass_kg, 0) +
       (bins.length - 1) * this.input.energy.bin_tare_mass.value;
     try {
+      const candidates = this.rankMissionRobots(
+        bins[0],
+        source,
+        destination,
+        meta,
+      );
+      if (!candidates.length) return false;
+      robot = candidates[0].robot;
       this.hallBase.mission(robot, bins[0], source, destination, {
         dropTier: meta.destinationStore
           ? (this.hall.stores[meta.destinationStore][meta.destinationSlot]
@@ -1845,6 +2020,9 @@ class Hall {
       this.tippers.find((t) => t.id === destination).inbound =
         (this.tippers.find((t) => t.id === destination).inbound ?? 0) +
         bins.length;
+    const withdrawal = job.phases.find((p) => p.kind === "pickup_withdrawal");
+    if (withdrawal)
+      this.schedule(withdrawal.end, "hall-source-released", { job: job.id }, 1);
     robot.jobsAdmitted = (robot.jobsAdmitted ?? 0) + 1;
     this.count("missions");
     return true;

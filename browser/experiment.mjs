@@ -387,7 +387,8 @@ export class Experiment {
       this.setPower(robot, this.input.energy.auxiliary_power.value);
       robot.job = null;
       job.status = "complete";
-      for (const key of job.leaseKeys) delete this.leases[key];
+      for (const key of job.leaseKeys)
+        if (this.leases[key] === job.id) delete this.leases[key];
       for (const key of Object.keys(this.calendar)) {
         this.calendar[key] = this.calendar[key].filter((r) => r.job !== job.id);
         if (!this.calendar[key].length) delete this.calendar[key];
@@ -622,6 +623,8 @@ export class Experiment {
       3600;
     const admitted =
       !!recovery && available - energy - recovery.kwh - wait >= reserve;
+    if (options.preview)
+      return admitted ? { phases, energy, recovery, available } : null;
     this.energyAdmission[robot.id] = {
       time: this.time,
       bin: this.bins[bin].id,
