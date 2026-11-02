@@ -39,9 +39,15 @@ function initialize(m) {
   meta = m;
   document.querySelector(".notice").textContent =
     m.purpose +
-    " · 166 conserved bin identities / " +
+    " · " +
+    m.bins.length +
+    " conserved bin identities / " +
     m.robotIds.length +
-    " AGVs. Initial 19,323 legacy fruit explicitly removed in named empty-FIFO mode; selected recipe stock is separately declared. Geometry, timings and selected recipe approvals remain provisional; unsupported closure blocks.";
+    " AGVs. " +
+    (m.startupStock
+      ? `${m.startupStock.fifoBins} full FIFO bins in two SKUs; filler/stacker stock explicitly declared. `
+      : "Initial legacy fruit removed; selected recipe stock separately declared. ") +
+    "Geometry, timings and recipe approvals remain provisional; unsupported closure blocks.";
   // Draw static permitted edges once, never rebuild glyphs on model events.
   for (const edge of m.network.edges)
     el("polyline", {
@@ -379,7 +385,7 @@ window.browserDemo = {
   error: null,
 };
 const scenario =
-  new URLSearchParams(location.search).get("scenario") || "mixed";
+  new URLSearchParams(location.search).get("scenario") || "working";
 $("scenario").value = scenario;
 $("scenario").onchange = () => {
   const url = new URL(location.href);

@@ -148,6 +148,7 @@ function publish() {
       tippers: s.tippers,
       hall: s.hall
         ? {
+            startupStock: s.hall.startupStock,
             production: s.hall.production,
             counts: s.hall.counts,
             compute: s.hall.compute,
@@ -196,27 +197,34 @@ onmessage = async ({ data: m }) => {
       ).json();
       run = new Experiment(
         input,
-        m.scenario === "active"
+        m.scenario === "working"
           ? {
               mode: "mixed",
               fleetSize: 8,
+              startup: "working",
               seed: m.seed ?? 1,
-              initialStock: [
-                { sku: "SKU23", bins: 12 },
-                { sku: "SKU24", bins: 12 },
-              ],
             }
-          : m.scenario === "boundary"
+          : m.scenario === "active"
             ? {
                 mode: "mixed",
                 fleetSize: 8,
                 seed: m.seed ?? 1,
-                trace: ["SKU05", "SKU17"],
-                fruitCount: 7902,
+                initialStock: [
+                  { sku: "SKU23", bins: 12 },
+                  { sku: "SKU24", bins: 12 },
+                ],
               }
-            : m.scenario === "mixed"
-              ? { mode: "mixed", fleetSize: 8, seed: m.seed ?? 1 }
-              : {},
+            : m.scenario === "boundary"
+              ? {
+                  mode: "mixed",
+                  fleetSize: 8,
+                  seed: m.seed ?? 1,
+                  trace: ["SKU05", "SKU17"],
+                  fruitCount: 7902,
+                }
+              : m.scenario === "mixed"
+                ? { mode: "mixed", fleetSize: 8, seed: m.seed ?? 1 }
+                : {},
       );
       input = run.input;
       locations.push(
@@ -250,6 +258,7 @@ onmessage = async ({ data: m }) => {
             ...(input.network.parking?.bays ?? []).map((b) => b.id),
           ],
           robotIds: run.robots.map((r) => r.id),
+          startupStock: run.hall?.startupStock,
           binStride,
           purpose: run.input.purpose,
           removedInitialFruit: input.removed_initial_fruit_count,

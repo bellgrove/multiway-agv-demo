@@ -1,3 +1,4 @@
+import { seedWorkingStartup } from "./startup.mjs";
 import { chargeIdle, finishCharge, scheduleBatteryWake } from "./charging.mjs";
 import { installParking, returnIdleHome } from "./parking.mjs";
 import { RECIPES } from "./recipes.mjs";
@@ -236,6 +237,7 @@ export function initializeHall(run, options) {
   }
   if (h.localEmpty.slots.length !== 3)
     throw Error("Three real accessible local empty-buffer slots required");
+  if (options.startup === "working") seedWorkingStartup(run);
   run.schedule(0, "hall-startup", {}, 1);
   if (h.fruitCount) run.schedule(0, "hall-fresh", { number: 0, sku: null });
 }
@@ -945,6 +947,10 @@ class Hall {
       if (t.run !== null || t.phase !== "idle" || t.blocked) continue;
       for (const [sku, recipe] of Object.entries(RECIPES)) {
         if (
+          (t.assignment && t.assignment !== sku) ||
+          Object.entries(h.tipperAssignments ?? {}).some(
+            ([cell, assigned]) => assigned === sku && cell !== t.id,
+          ) ||
           Object.entries(h.carryover).some(
             ([k, c]) => c.owner === t.id && c.fruit > 0 && k !== sku,
           ) ||
@@ -2000,7 +2006,7 @@ class Hall {
         0,
       );
     s.accounting = {
-      physicalBins: 166,
+      physicalBins: this.bins.length,
       initial,
       admitted: this.admitted,
       inventory,
