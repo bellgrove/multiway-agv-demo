@@ -1,3 +1,4 @@
+import { chargeIdle, finishCharge, scheduleBatteryWake } from "./charging.mjs";
 import { installParking, returnIdleHome } from "./parking.mjs";
 import { RECIPES } from "./recipes.mjs";
 const clone = structuredClone;
@@ -90,11 +91,16 @@ export function initializeHall(run, options) {
     fronts: Object.fromEntries(
       Object.entries(run.input.network.storage_slots).map(([store, slots]) => [
         store,
-        Object.fromEntries(slots.map((slot) => [
-          slot.slot,
-          slots.filter((front) => front.lane === slot.lane && front.depth < slot.depth)
-            .map((front) => front.slot),
-        ])),
+        Object.fromEntries(
+          slots.map((slot) => [
+            slot.slot,
+            slots
+              .filter(
+                (front) => front.lane === slot.lane && front.depth < slot.depth,
+              )
+              .map((front) => front.slot),
+          ]),
+        ),
       ]),
     ),
     cells: new Map(run.input.cells.map((cell) => [cell.id, cell])),
@@ -102,9 +108,14 @@ export function initializeHall(run, options) {
       Object.entries(run.input.network.storage_slots).map(([store, slots]) => [
         store,
         {
-          depth: [...slots].sort((a, b) => b.depth - a.depth || a.lane - b.lane),
-          right: [...slots].sort((a, b) =>
-            b.centre_xy_m[0] - a.centre_xy_m[0] || b.depth - a.depth || a.lane - b.lane,
+          depth: [...slots].sort(
+            (a, b) => b.depth - a.depth || a.lane - b.lane,
+          ),
+          right: [...slots].sort(
+            (a, b) =>
+              b.centre_xy_m[0] - a.centre_xy_m[0] ||
+              b.depth - a.depth ||
+              a.lane - b.lane,
           ),
         },
       ]),
@@ -119,8 +130,7 @@ export function initializeHall(run, options) {
   if (!(h.actualLoss >= 0 && h.actualLoss <= 1))
     throw Error("Invalid actual loss scenario");
   run.input.id = "mixed-grade-empty-FIFO-166-v1";
-  run.input.purpose =
-    "Provisional mixed-grade four-robot hall; selected fixed-count recipe admission; unresolved closure modes blocked";
+  run.input.purpose = `Provisional mixed-grade ${run.robots.length}-AGV hall; selected fixed-count recipe admission; unresolved closure modes blocked`;
   run.config.mode = "mixed";
   run.config.seed = h.seed;
   run.config.fruitCount = h.fruitCount;
@@ -271,7 +281,9 @@ class Hall {
     }
     if (kind === "mission-end") {
       const job = this.jobs[d.job];
+      finishCharge(this, job);
       this.hallBase.handle(kind, d);
+      scheduleBatteryWake(this, this.robots[job.robot]);
       if (job.meta.kind === "idle-home") {
         h.parking.occupancy[job.destination] = this.robots[job.robot].id;
         this.record("idle-home-complete", {
@@ -281,7 +293,14 @@ class Hall {
       }
       return;
     }
+    if (kind === "hall-energy-wake") {
+      const robot = this.robots[d.robot];
+      if (robot.batteryWake === d.token && robot.job === null)
+        this.notify("battery-threshold", robot.id);
+      return;
+    }
     if (kind === "hall-startup") {
+      for (const robot of this.robots) scheduleBatteryWake(this, robot);
       this.record("hall-startup", { startup: h.startup });
       this.notify("station-ready", "hall");
       return;
@@ -800,6 +819,27 @@ class Hall {
         );
       if (incoming) return null; // retain the real compatible stack target, not fragmented singleton stock
     }
+    // Do not bury another cohort, empty supply, or an unfinished rear stack.
+    // A partial stack must remain reachable until completed, and reserved rear
+    // stock must remain available to its already-admitted packing run.
+    const clearForPutaway = (slot) =>
+      this.leases[`column:${store}:${slot.lane}`] === undefined &&
+      !slots.some(
+        (other) =>
+          other.lane === slot.lane &&
+          ((other.depth < slot.depth && (cells[other.slot] ?? []).length) ||
+            (other.depth > slot.depth &&
+              (cells[other.slot] ?? []).some((i) => {
+                const b = this.bins[i],
+                  source = this.bins[bins[0]];
+                return (
+                  cells[other.slot].length < 3 ||
+                  b.batch != null ||
+                  b.sku !== source.sku ||
+                  b.sourceGroup !== source.sourceGroup
+                );
+              }))),
+      );
     let partialTarget = null;
     if (bins.length === 1 && this.bins[bins[0]].sku !== null) {
       const source = this.bins[bins[0]];
@@ -808,6 +848,7 @@ class Hall {
           .filter((slot) => {
             const current = cells[slot.slot] ?? [];
             return (
+              clearForPutaway(slot) &&
               current.length > 0 &&
               current.length < 3 &&
               current.every(
@@ -822,10 +863,12 @@ class Hall {
             (a, b) => b.centre_xy_m[0] - a.centre_xy_m[0] || b.depth - a.depth,
           )[0]?.slot ?? null;
     }
-    const order = this.planningIndex.putaway[store][rightFirst ? "right" : "depth"];
+    const order =
+      this.planningIndex.putaway[store][rightFirst ? "right" : "depth"];
     for (const slot of order) {
       const current = cells[slot.slot] ?? [];
       if (partialTarget !== null && slot.slot !== partialTarget) continue;
+      if (!clearForPutaway(slot)) continue;
       if (
         store === "low_staging" &&
         this.bins[bins[0]].sku !== null &&
@@ -861,18 +904,20 @@ class Hall {
   }
   freeStock(sku) {
     this.hall.compute.stockLookups++;
-    return [...new Set(this.hall.fullBySku[sku] ?? [])].filter((i) => {
-      const b = this.bins[i];
-      return (
-        b.phase === "full-ready" &&
-        this.hall.fifoStores.includes(b.location) &&
-        b.fifoEnteredAt !== null &&
-        b.batch == null &&
-        this.leases[`bin:${i}`] === undefined &&
-        !b.conveyor &&
-        b.sku === sku
-      );
-    }).sort((a, b) => this.bins[a].fifoEnteredAt - this.bins[b].fifoEnteredAt);
+    return [...new Set(this.hall.fullBySku[sku] ?? [])]
+      .filter((i) => {
+        const b = this.bins[i];
+        return (
+          b.phase === "full-ready" &&
+          this.hall.fifoStores.includes(b.location) &&
+          b.fifoEnteredAt !== null &&
+          b.batch == null &&
+          this.leases[`bin:${i}`] === undefined &&
+          !b.conveyor &&
+          b.sku === sku
+        );
+      })
+      .sort((a, b) => this.bins[a].fifoEnteredAt - this.bins[b].fifoEnteredAt);
   }
   admit() {
     const h = this.hall,
@@ -904,7 +949,9 @@ class Hall {
             ([k, c]) => c.owner === t.id && c.fruit > 0 && k !== sku,
           ) ||
           h.skuOwners[sku] !== undefined ||
-          !this.planningIndex.cells.get(t.id).compatible_skus.value.includes(sku)
+          !this.planningIndex.cells
+            .get(t.id)
+            .compatible_skus.value.includes(sku)
         )
           continue;
         const stock = stocks.get(sku);
@@ -969,7 +1016,8 @@ class Hall {
             // never permits reaching through an older bottom bin's upper tiers.
             stack.sort((a, b) => this.bins[b].tier - this.bins[a].tier);
             const next = new Map(plans),
-              sizes = stack.length >= 3 ? [3, 2] : stack.length === 2 ? [2] : [];
+              sizes =
+                stack.length >= 3 ? [3, 2] : stack.length === 2 ? [2] : [];
             for (const [count, plan] of plans)
               for (const size of sizes)
                 if (count + size <= recipe.minimum && !next.has(count + size))
@@ -1050,15 +1098,9 @@ class Hall {
         if (t.run !== null) break;
       }
     }
-    for (const m of this.machines) {
-      if (m.bin !== null && this.bins[m.bin].phase === "full-ready") {
-        const b = this.bins[m.bin],
-          r = RECIPES[b.sku];
-        m.blocked = !r
-          ? "unsupported: no selected count/closure recipe"
-          : `compatible reachable recipe minimum ${r.minimum}; available ${(stocks.get(b.sku) ?? this.freeStock(b.sku)).filter((i) => this.bins[i].batch == null).length}`;
-      }
-    }
+    // Batch eligibility belongs to FIFO stock, not a full bin still on a
+    // filler. Dispatch below reports actual transport/space/energy blockers.
+    for (const m of this.machines) m.blocked = null;
   }
   sharedReturns() {
     const h = this.hall,
@@ -1337,6 +1379,7 @@ class Hall {
           (a.jobsAdmitted ?? 0) - (b.jobsAdmitted ?? 0) ||
           a.id.localeCompare(b.id),
       )) {
+      if (chargeIdle(this, robot)) continue;
       let assigned = false;
       // Direct needed empties precede storage; finite bottom refill counts
       // assigned/inbound, while usable stock is projected separately.
@@ -1530,18 +1573,56 @@ class Hall {
             : [];
         if (!bins.length || bins.some((i) => this.bins[i].batch != null))
           continue;
-        const slot = this.storageDestination("low_staging", bins, true);
+        const source = this.bins[bins[0]];
+        // Finish a real singleton stack across BOTH FIFO stores. Fallback must
+        // not turn the last twelve bins into 3+3+3+2+1 untransportable stock.
         if (
-          slot &&
-          this.missionHall(robot, bins, m.id, slot.dropoff_node, {
-            kind: "full-store",
-            destinationStore: "low_staging",
-            destinationSlot: slot.slot,
+          bins.length === 1 &&
+          this.robots.some((r) => {
+            const job = r.job === null ? null : this.jobs[r.job];
+            return (
+              job?.meta.kind === "full-store" &&
+              this.bins[job.bin].sku === source.sku &&
+              this.bins[job.bin].sourceGroup === source.sourceGroup
+            );
           })
-        ) {
-          assigned = true;
-          break;
+        )
+          continue;
+        const partialStore =
+          bins.length === 1
+            ? h.fifoStores.find((store) =>
+                Object.values(h.stores[store]).some(
+                  (stack) =>
+                    stack.length > 0 &&
+                    stack.length < 3 &&
+                    stack.every(
+                      (i) =>
+                        this.bins[i].sku === source.sku &&
+                        this.bins[i].sourceGroup === source.sourceGroup,
+                    ) &&
+                    // Ignore permanent rear blockage, but wait for transient leases.
+                    this.planningIndex.fronts[store][
+                      this.bins[stack[0]].slot
+                    ].every((front) => !h.stores[store][front]?.length),
+                ),
+              )
+            : null;
+        for (const store of partialStore ? [partialStore] : h.fifoStores) {
+          const slot = this.storageDestination(store, bins, true);
+          if (
+            slot &&
+            this.missionHall(robot, bins, m.id, slot.dropoff_node, {
+              kind: "full-store",
+              destinationStore: store,
+              destinationSlot: slot.slot,
+            })
+          ) {
+            assigned = true;
+            break;
+          }
         }
+        if (assigned) break;
+        m.blocked ??= "waiting for reachable compatible FIFO space/transport";
       }
       if (assigned) continue;
       if (h.shared.length === 3 && this.leases.shared_empty === undefined) {
@@ -1596,8 +1677,11 @@ class Hall {
     bins = [...bins].sort((a, b) => this.bins[a].tier - this.bins[b].tier);
     if (meta.store) {
       const current = this.hall.stores[meta.store][meta.slot] ?? [];
-      if (current.length < bins.length ||
-          current.slice(-bins.length).some((i) => !bins.includes(i))) return false;
+      if (
+        current.length < bins.length ||
+        current.slice(-bins.length).some((i) => !bins.includes(i))
+      )
+        return false;
     }
     const old = this.jobs.length,
       b = this.bins[bins[0]],
@@ -1667,8 +1751,10 @@ class Hall {
         h.localEmpty.outbound -= job.bins.length;
       if (meta.store) {
         const stack = h.stores[meta.store][meta.slot];
-        if (stack.length < job.bins.length ||
-            stack.slice(-job.bins.length).some((i) => !job.bins.includes(i)))
+        if (
+          stack.length < job.bins.length ||
+          stack.slice(-job.bins.length).some((i) => !job.bins.includes(i))
+        )
           throw Error("Storage pickup must remove the actual top bins");
         h.stores[meta.store][meta.slot] = stack.filter(
           (i) => !job.bins.includes(i),
@@ -1874,6 +1960,19 @@ class Hall {
   observe() {
     const s = this.hallBase.observe(),
       h = this.hall;
+    for (const robot of s.robots) {
+      const job = robot.job === null ? null : this.jobs[robot.job];
+      if (job?.meta.kind === "charge") {
+        const phase = job.phases.at(-1);
+        const fraction = Math.max(
+          0,
+          Math.min(1, (this.time - phase.start) / (phase.end - phase.start)),
+        );
+        robot.soc += (fraction * job.meta.suppliedKwh) / robot.usable_kwh;
+        robot.charged_kwh =
+          (robot.charged_kwh ?? 0) + fraction * job.meta.suppliedKwh;
+      }
+    }
     for (const b of s.bins) {
       if (b.sku)
         b.normalAdmission = clone(
@@ -1934,6 +2033,22 @@ class Hall {
       },
     };
     s.hall = clone(h);
+    s.hall.production = {
+      tippedFruit: h.counts.packing ?? 0,
+      packedFruit: h.runs.reduce(
+        (n, batch) => n + batch.layers * 8 * batch.recipe.size,
+        0,
+      ),
+      completedPallets: h.runs.reduce(
+        (n, batch) => n + batch.completedPallets.length,
+        0,
+      ),
+      rejects: h.counts["inspection-rejects"] ?? 0,
+      emptyBins: s.bins.filter((b) => b.sku === null).length,
+      putaways: h.counts["full-stored"] ?? 0,
+      emptyReturns: h.counts["shared-empty"] ?? 0,
+      chargesCompleted: h.counts["charge-complete"] ?? 0,
+    };
     s.hall.carryoverBoundary =
       "At most 40 occupied tray positions per cell; cell-owned, no downstream loose-tray buffer; incompatible changeover blocked pending physical removal authority";
     s.hall.recipes = clone(RECIPES);

@@ -39,7 +39,9 @@ function initialize(m) {
   meta = m;
   document.querySelector(".notice").textContent =
     m.purpose +
-    " · 166 conserved bin identities / four robots. Initial 19,323 legacy fruit explicitly removed in named empty-FIFO mode; selected recipe stock is separately declared. Geometry, timings and selected recipe approvals remain provisional; unsupported closure blocks.";
+    " · 166 conserved bin identities / " +
+    m.robotIds.length +
+    " AGVs. Initial 19,323 legacy fruit explicitly removed in named empty-FIFO mode; selected recipe stock is separately declared. Geometry, timings and selected recipe approvals remain provisional; unsupported closure blocks.";
   // Draw static permitted edges once, never rebuild glyphs on model events.
   for (const edge of m.network.edges)
     el("polyline", {
@@ -96,7 +98,7 @@ function initialize(m) {
     g.addEventListener("click", () => choose(b.id));
     binGlyphs.push({ g, base, fill });
   }
-  for (const id of ["V1", "V2", "V3", "V4"]) {
+  for (const id of m.robotIds) {
     const g = el("g", { "data-robot": id }),
       diamond = el(
         "path",
@@ -114,10 +116,7 @@ function initialize(m) {
   }
   for (const id of [
     ...m.bins.map((b) => b.id),
-    "V1",
-    "V2",
-    "V3",
-    "V4",
+    ...m.robotIds,
     ...m.stationIds,
   ]) {
     const o = document.createElement("option");
@@ -311,6 +310,10 @@ function draw(m) {
     null,
     2,
   );
+  const production = m.hall?.production;
+  $("production").textContent = production
+    ? `Packed into palletizer transfer groups: ${production.packedFruit.toLocaleString()} fruit · ${production.completedPallets} complete pallets · ${production.emptyBins} empty bins · ${production.chargesCompleted} charges completed`
+    : "Single-bin circulation witness";
   $("fleet").textContent = m.robots
     .map(
       (r) =>

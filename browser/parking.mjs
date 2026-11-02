@@ -1,6 +1,6 @@
 import { Navigation } from "./navigation.mjs";
 import { phaseEnergy } from "./energy.mjs";
-// User-designated region LEFT OF T5. These explicit four empty-vehicle bays and
+// User-designated region LEFT OF T5. These explicit finite empty-vehicle bays and
 // parking-only links are provisional configuration, NOT surveyed site geometry.
 // They add no bin positions and do not change the single C1 charging capacity.
 export function installParking(run) {
@@ -43,13 +43,17 @@ export function installParking(run) {
   let previous = node("idle-base:entry", [52.5, -7]);
   link(anchor, previous);
   const bays = [];
-  for (let i = 0; i < 4; i++) {
-    const x = 54 + 2 * i,
-      junction = node(`idle-base:aisle:${i}`, [x, -7]);
+  for (let i = 0; i < run.robots.length; i++) {
+    if (i === 4) {
+      previous = node("idle-base:second-entry", [52.5, -11]);
+      link("idle-base:entry", previous);
+    }
+    const x = 54 + 2 * (i % 4),
+      junction = node(`idle-base:aisle:${i}`, [x, i < 4 ? -7 : -11]);
     link(previous, junction);
     previous = junction;
     const id = `P${i + 1}`,
-      bay = node(`idle-base:bay:${id}`, [x, -8.5]);
+      bay = node(`idle-base:bay:${id}`, [x, i < 4 ? -8.5 : -12.5]);
     link(junction, bay);
     network.nodes[id] = network.nodes[bay];
     network.station_nodes[id] = bay;
@@ -104,7 +108,15 @@ export function installParking(run) {
     bays,
   };
   run.hall.parking = { ...structuredClone(network.parking), occupancy: {} };
-  for (const [i, robot] of run.robots.entries()) robot.home = bays[i].id;
+  for (const [i, robot] of run.robots.entries()) {
+    robot.home = bays[i].id;
+    if (i >= 4) {
+      robot.location = robot.home;
+      robot.position_m = network.nodes[robot.home];
+      run.input.vehicles[i].location = robot.home;
+      run.hall.parking.occupancy[robot.home] = robot.id;
+    }
+  }
   run.navigation = new Navigation(network, run.input.handling);
 }
 export function returnIdleHome(run, robot) {

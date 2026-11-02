@@ -1,19 +1,20 @@
 {
-  "source_commit": "deffadbf3a7945a5b123c988b816820760971d36",
+  "source_commit": "1b55c323f454c8f05d150f31e00a9d0725931ecb",
   "variant": "browser-owned mixed hall with physical FIFO and event-driven planning",
   "entry": "browser/index.html?scenario=active",
   "sha256": {
     "playback.css": "4ffdfa03262078841412116bb8eb1a36c02cba23604a968a557f9a89795d87f6",
     "motion.js": "436e6e0e70601baf0981a5d35a81c3dde817ca0b27ce6091a6a5dfd00bd5fe5e",
-    "browser/index.html": "1b134e3e532437185e787156063aae24a56263e32b0b259bad610fafc14d5cf3",
-    "browser/page.mjs": "b059a8cbe36544b64cd355c61772f679453eee656e8f503c79d3a352b9ec4b65",
-    "browser/worker.mjs": "4eb77b2fea304fb75fa86d6e735ae925e8535cfcf62459e9b816872782428770",
-    "browser/experiment.mjs": "c42a0f041b48c8540045d17b4eb74c6cc1d000fab56a7caa204c8c6b56e327c0",
+    "browser/index.html": "e3c32adc7c9939cf16ce360e30f1f49894ed07859dcb73e6cc3a771f67334d28",
+    "browser/page.mjs": "5e6d6d5a1c76fe79c453acef34ab75cacfdd2b3512df29cabd6de0862149ffeb",
+    "browser/worker.mjs": "cfb5a9ad161dd6535fda557df887b56216ac4ad2625609205c4a85190bcee31e",
+    "browser/experiment.mjs": "f5462cea2fc110083a340597a689bad016e7e21564c8ec20b836a46e6349d040",
     "browser/navigation.mjs": "be66155d9f751d74bf5f4d52857d9ab924d21304981acce7d663e3ad37ec46ef",
     "browser/energy.mjs": "811ed6f7c2c35ae9c020d01f0861cff612170f2e05522d5f22f69b74b8baf03b",
-    "browser/hall.mjs": "289e6008fabac14129b1dd17aac9a634e57689323895e5dbec1829d2bcd7a024",
-    "browser/parking.mjs": "8f44b9d0cbc6ca7cb888565d34ab37bf4a454a9b2410c707d5b86dd743c860ce",
+    "browser/hall.mjs": "cbd586737f48ec7e1042cd76c75037bf798933728c0ec1b126dfdc8a5726d8d3",
+    "browser/parking.mjs": "5e7f8fc9ccf4074b454e1a47ddd534304865a74e3ae913ecd2fdb7cda09e0341",
     "browser/recipes.mjs": "b4734bf086e93a37ac5563c1d6220c9c02f06be6f2f721beab353e32365ee4ea",
+    "browser/charging.mjs": "d95975d5b613d1824979577e37ac55b283e752fbcab7b265ceed004a1233305e",
     "browser/sku-catalog.mjs": "f78208efc47c2d5151020ca5a403b4d6a96952dc436fb6a397daf3437ee73005",
     "browser/demo-input.json": "713c696ab3767b6fab8a023cdc72eda1611fe42b7d0f8d0728ae4d6df9be81b8"
   }

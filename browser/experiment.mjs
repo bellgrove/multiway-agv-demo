@@ -83,6 +83,19 @@ export class Experiment {
     )
       throw Error("Invalid finite grader/conveyor configuration");
     this.input = copy(input);
+    const fleetSize = options.fleetSize ?? input.vehicles.length;
+    if (
+      !Number.isInteger(fleetSize) ||
+      fleetSize < 4 ||
+      fleetSize > 8 ||
+      (options.mode !== "mixed" && fleetSize !== 4)
+    )
+      throw Error("Mixed hall supports four to eight AGVs");
+    while (this.input.vehicles.length < fleetSize) {
+      const vehicle = copy(input.vehicles[0]);
+      vehicle.id = `V${this.input.vehicles.length + 1}`;
+      this.input.vehicles.push(vehicle);
+    }
     this.navigation =
       options.mode === "mixed"
         ? null
@@ -168,7 +181,7 @@ export class Experiment {
         ? "destination blocked by declared fixture"
         : null,
     };
-    this.robots = input.vehicles.map((v) => ({
+    this.robots = this.input.vehicles.map((v) => ({
       id: v.id,
       location: v.location,
       phase: null,
