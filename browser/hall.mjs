@@ -238,7 +238,10 @@ export function initializeHall(run, options) {
     .map((c) => ({
       id: c.id,
       bin: null,
-      queue: [],
+      queue: [], // actual destacker stock, separate from the AGV dropoff
+      dropoff: [],
+      dropoffMoving: false,
+      destackerInbound: 0,
       run: null,
       phase: "idle",
       blocked: options.blockTipper ? "destination blocked by fixture" : null,
@@ -569,6 +572,16 @@ class Hall {
         b.readyAt = this.time + cfg.inserted_empty_ready_delay;
         this.schedule(b.readyAt, "hall-empty-ready", { bin: d.bins[0] }, 1);
       }
+      if (d.operation === "tip-stack-arrive") {
+        const t = this.tippers.find((t) => t.id === d.location);
+        t.dropoff = t.dropoff.filter((i) => !d.bins.includes(i));
+        t.queue.push(...d.bins);
+        t.dropoffMoving = false;
+        t.destackerInbound = 0;
+        this.record("tip-destacker-stack-arrive", {
+          tipper: t.id, bins: d.bins.map((i) => this.bins[i].id),
+        });
+      }
       if (d.operation === "tip-single-arrive") {
         const t = this.tippers.find((t) => t.id === d.location),
           i = d.bins[0],
@@ -860,7 +873,7 @@ class Hall {
       d.operation === "feeder-single"
         ? 0
         : d.operation === "tip-single-arrive"
-          ? 1
+          ? 0
           : d.operation === "shared-arrive"
             ? 3
             : points.length - 1;
@@ -1935,11 +1948,25 @@ class Hall {
   tip() {
     const h = this.hall;
     for (const [ti, t] of this.tippers.entries()) {
+      // A whole stack advances only after the fork clears the dropoff and the
+      // distinct destacker is empty, including its outgoing single in transit.
+      if (t.dropoff.length && !t.dropoffMoving && !t.queue.length &&
+          t.phase !== "tip-conveyor" && this.leases[t.id] === undefined) {
+        const flow = this.input.network.tipper_flow.tippers[t.id];
+        t.dropoffMoving = true;
+        t.destackerInbound = t.dropoff.length;
+        this.move([...t.dropoff], [flow.dropoff, flow.destacker], {
+          operation: "tip-stack-arrive", location: t.id, phase: "tip-destacker",
+        });
+        this.record("tip-destacker-stack-start", {
+          tipper: t.id, bins: t.dropoff.map((i) => this.bins[i].id),
+        });
+      }
+      // Fork access is at dropoff, not at the independent downstream tipper.
       if (
         t.bin !== null ||
         !t.queue.length ||
-        t.blocked ||
-        this.leases[t.id] !== undefined
+        t.blocked
       )
         continue;
       // A full shared stacker may hold a future EMPTY on its tipper;
@@ -1960,7 +1987,7 @@ class Hall {
       b.tier = 1;
       this.move(
         [i],
-        [flow.dropoff, flow.destacker, flow.tip],
+        [flow.destacker, flow.tip],
         { operation: "tip-single-arrive", location: t.id },
         this.input.handling.single_destack.value,
       );
@@ -1972,6 +1999,8 @@ class Hall {
         batch.tipped !== batch.bins.length ||
         t.bin !== null ||
         t.queue.length ||
+        t.dropoff.length ||
+        t.destackerInbound ||
         batch.phase === "reconciled"
       )
         continue;
@@ -2289,26 +2318,7 @@ class Hall {
             { kind: "feeder" },
           );
         if (!assigned) {
-          for (const [slot, stack] of Object.entries(
-            h.stores.empty_staging ?? {},
-          )) {
-            if (
-              stack.length === 3 &&
-              this.accessible(stack[0]) &&
-              this.leases[
-                `column:empty_staging:${this.input.network.storage_slots.empty_staging[slot].lane}`
-              ] === undefined
-            ) {
-              assigned = this.missionHall(
-                robot,
-                [...stack],
-                this.source(stack[0]),
-                "grader_empty_drop",
-                { kind: "feeder", store: "empty_staging", slot: Number(slot) },
-              );
-              if (assigned) break;
-            }
-          }
+          assigned = this.supplyFeederFromBestSource(robot);
         }
       }
       if (
@@ -2384,20 +2394,12 @@ class Hall {
         if (
           !batch ||
           t.blocked ||
-          t.queue.length +
-            (t.bin !== null ? 1 : 0) +
-            (t.inbound ?? 0) +
-            (t.inboundConveyor ?? 0) >=
-            3 ||
+          t.dropoff.length + (t.inbound ?? 0) >= 3 ||
           this.leases[t.id] !== undefined
         )
           continue;
         const free =
-          3 -
-          t.queue.length -
-          (t.bin !== null ? 1 : 0) -
-          (t.inbound ?? 0) -
-          (t.inboundConveyor ?? 0);
+          3 - t.dropoff.length - (t.inbound ?? 0);
         const transport = batch.transportGroups.find(
           (g) =>
             g.job === null &&
@@ -2647,6 +2649,7 @@ class Hall {
         robot,
         priority,
         response,
+        delivery: preview.phases.find((p) => p.kind === "drop")?.end ?? Infinity,
         completion: preview.phases.at(-1).end,
         sourceClearance: preview.phases.find((p) => p.kind === "pickup_withdrawal")?.end ?? Infinity,
       });
@@ -2656,7 +2659,7 @@ class Hall {
         // Critical empty supply optimizes the actual physical objective before
         // regional preferences: delivered stock, or clearing a blocked source.
         (meta.kind === "feeder"
-          ? a.completion - b.completion || a.response - b.response
+          ? a.delivery - b.delivery || a.completion - b.completion || a.response - b.response
           : meta.feederPreparation
             ? a.sourceClearance - b.sourceClearance || a.response - b.response
             : 0) ||
@@ -2666,6 +2669,51 @@ class Hall {
         (a.robot.jobsAdmitted ?? 0) - (b.robot.jobsAdmitted ?? 0) ||
         a.robot.id.localeCompare(b.robot.id),
     );
+  }
+  missionStackPayload(bins) {
+    // phaseEnergy adds one bin tare itself. A separate payload preserves that
+    // convention without changing a real bin while exploring alternatives.
+    return {
+      ...this.bins[bins[0]],
+      fruit_mass_kg: bins.reduce((n, i) => n + this.bins[i].fruit_mass_kg, 0) +
+        (bins.length - 1) * this.input.energy.bin_tare_mass.value,
+    };
+  }
+  supplyFeederFromBestSource(robot) {
+    const destination = "grader_empty_drop";
+    const destinationNotBefore = feederDestinationReadyAt(this);
+    if (destinationNotBefore === null || this.hall.feederInbound ||
+        this.leases[destination] !== undefined ||
+        this.hall.feeder.flat().length + 3 >
+          (this.input.equipment_config.feeder_capacity ?? 9)) return false;
+    const sources = Object.entries(this.hall.stores.empty_staging ?? {}).map(
+      ([slot, bins]) => ({ bins, meta: { kind: "feeder", store: "empty_staging", slot: Number(slot) } }),
+    );
+    sources.push({ bins: this.hall.t5.returned, meta: { kind: "feeder" } });
+    const candidates = [];
+    for (const candidate of sources) {
+      const bins = [...candidate.bins].sort((a, b) => this.bins[a].tier - this.bins[b].tier);
+      if (bins.length !== 3 || bins.some((i) => {
+        const b = this.bins[i];
+        return b.sku !== null || b.fruit_count !== 0 || b.phase !== "empty-ready" ||
+          b.conveyor || this.leases[`bin:${i}`] !== undefined || !this.accessible(i);
+      })) continue;
+      const source = this.source(bins[0]);
+      if (this.leases[source] !== undefined) continue;
+      const meta = { ...candidate.meta, destinationNotBefore };
+      const best = this.rankMissionRobots(bins[0], source, destination, meta, {
+        emptyPickup: false, payload: this.missionStackPayload(bins),
+      })[0];
+      if (best) candidates.push({ bins, source, meta, best });
+    }
+    candidates.sort((a, b) => a.best.delivery - b.best.delivery ||
+      a.best.completion - b.best.completion || a.best.response - b.best.response);
+    // Shared-output draining retains its prior precedence; local protected
+    // empties remain a fallback. These are only interchangeable supply sources.
+    for (const candidate of candidates)
+      if (this.missionHall(robot, candidate.bins, candidate.source, destination, candidate.meta))
+        return true;
+    return false;
   }
   putawayOrder() {
     const h = this.hall;
@@ -2818,11 +2866,11 @@ class Hall {
         fifoOverflowReason: reason,
       };
     }
-    if (
-      meta.kind === "full-tip" &&
-      this.bins[bins[0]].location !== "wall_storage"
-    )
-      return false;
+    if (meta.kind === "full-tip") {
+      const t = this.tippers.find((t) => t.id === destination);
+      if (!t || t.dropoff.length + (t.inbound ?? 0) + bins.length > 3 ||
+          this.bins[bins[0]].location !== "wall_storage") return false;
+    }
     if (
       meta.kind === "fifo-relocate" &&
       (meta.destinationStore !== "wall_storage" || meta.store !== "low_staging")
@@ -2845,34 +2893,28 @@ class Hall {
         return false;
     }
     const old = this.jobs.length,
-      b = this.bins[bins[0]],
-      mass = b.fruit_mass_kg;
+      b = this.bins[bins[0]];
     // Admission includes the actual whole carried stack, not one-bin mass.
-    b.fruit_mass_kg =
-      bins.reduce((n, i) => n + this.bins[i].fruit_mass_kg, 0) +
-      (bins.length - 1) * this.input.energy.bin_tare_mass.value;
-    try {
-      const candidates = this.rankMissionRobots(
-        bins[0],
-        source,
-        destination,
-        meta,
-        { emptyPickup: b.sku === null && bins.length === 1 },
-      );
-      if (!candidates.length) return false;
-      robot = candidates[0].robot;
-      this.hallBase.mission(robot, bins[0], source, destination, {
-        emptyPickup: b.sku === null && bins.length === 1,
-        destinationNotBefore: meta.destinationNotBefore,
-        destinationLeaseOwner: meta.turnoverFor,
-        dropTier: meta.destinationStore
-          ? (this.hall.stores[meta.destinationStore][meta.destinationSlot]
-              ?.length ?? 0) + 1
-          : 1,
-      });
-    } finally {
-      b.fruit_mass_kg = mass;
-    }
+    const payload = this.missionStackPayload(bins);
+    const candidates = this.rankMissionRobots(
+      bins[0],
+      source,
+      destination,
+      meta,
+      { emptyPickup: b.sku === null && bins.length === 1, payload },
+    );
+    if (!candidates.length) return false;
+    robot = candidates[0].robot;
+    this.hallBase.mission(robot, bins[0], source, destination, {
+      payload,
+      emptyPickup: b.sku === null && bins.length === 1,
+      destinationNotBefore: meta.destinationNotBefore,
+      destinationLeaseOwner: meta.turnoverFor,
+      dropTier: meta.destinationStore
+        ? (this.hall.stores[meta.destinationStore][meta.destinationSlot]
+            ?.length ?? 0) + 1
+        : 1,
+    });
     if (this.jobs.length === old) return false;
     const job = this.jobs.at(-1);
     job.bins = bins;
@@ -3056,7 +3098,7 @@ class Hall {
         t.inbound -= job.bins.length;
         h.runs[meta.batch].transportGroups[meta.transportGroup].status =
           "delivered";
-        t.queue.push(...job.bins);
+        t.dropoff.push(...job.bins);
         for (const i of job.bins) {
           this.bins[i].phase = "tip-queued";
           this.bins[i].slot = 0;
@@ -3261,7 +3303,13 @@ class Hall {
       "Separate labelled remainder stock, conservative at most 40 occupied tray positions per SKU across cohorts; recalled once only for matching SKU/source-group/recipe; not packed or shipped output";
     s.hall.recipes = clone(RECIPES);
     s.hall.localEmptyStock = this.localEmptyStatus();
-    s.tippers = clone(this.tippers);
+    s.tippers = clone(this.tippers).map((t) => ({ ...t, inputBuffers: {
+      dropoff: { assigned: t.dropoff.length, inbound: t.inbound ?? 0, capacity: 3,
+        moving: t.dropoffMoving },
+      destacker: { assigned: t.queue.length, inbound: t.destackerInbound,
+        outgoing: t.phase === "tip-conveyor" ? 1 : 0, capacity: 3 },
+      tipper: { assigned: t.bin === null ? 0 : 1, capacity: 1 },
+    } }));
     s.hall.feederStock = {
       assigned: h.feeder.reduce((n, a) => n + a.length, 0),
       inbound: h.feederInbound,

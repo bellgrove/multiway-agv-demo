@@ -48,6 +48,7 @@ const phases = [
   "empty",
   "inserted",
   "tip-queued",
+  "tip-destacker",
   "external-prepack-processing",
 ];
 const locations = [],

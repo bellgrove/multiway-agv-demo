@@ -262,7 +262,7 @@ function draw(m) {
     if (meta.network.tipper_flow.tippers[meta.locations[location]] && !conveyor)
       position =
         meta.network.tipper_flow.tippers[meta.locations[location]][
-          phase === "tip-queued" ? "dropoff" : "tip"
+          phase === "tip-queued" ? "dropoff" : phase === "tip-destacker" ? "destacker" : "tip"
         ];
     const glyph = TracePresentation.binGlyph(
       [

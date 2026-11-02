@@ -575,7 +575,7 @@ export class Experiment {
         destinationNotBefore: options.destinationNotBefore,
       },
     );
-    const energy = phaseEnergy(phases, this.bins[bin], this.input.energy);
+    const energy = phaseEnergy(phases, options.payload ?? this.bins[bin], this.input.energy);
     const vehicle = this.input.vehicles[this.robots.indexOf(robot)];
     const usable = vehicle.usable_energy.value;
     const available =

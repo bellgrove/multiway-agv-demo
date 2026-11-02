@@ -1,3 +1,50 @@
+// CAD splitting can introduce millimetre side-steps at storage junctions.
+// Normalize heading only for a whole source stroke fitting a 2 mm straight band;
+// retain every actual edge, distance, permission and traffic resource unchanged.
+function straightCadEdges(edges) {
+  const compiled = edges.map((edge) => ({ ...edge }));
+  const groups = new Map();
+  for (const edge of compiled)
+    for (const id of edge.source_geometry_ids ?? []) {
+      if (!groups.has(id)) groups.set(id, []);
+      groups.get(id).push(edge);
+    }
+  for (const group of groups.values()) {
+    const points = [...new Map(group.flatMap((edge) => edge.geometry_m)
+      .map((point) => [point.join(","), point])).values()];
+    let span = 0, origin, endpoint;
+    for (const a of points) for (const b of points) {
+      const distance = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (distance > span) { span = distance; origin = a; endpoint = b; }
+    }
+    if (span < 0.1) continue;
+    const dx = (endpoint[0] - origin[0]) / span,
+      dy = (endpoint[1] - origin[1]) / span;
+    if (points.some((p) => Math.abs((p[0] - origin[0]) * dy -
+      (p[1] - origin[1]) * dx) > 0.002)) continue;
+    const heading = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+    const meaningful = group.filter((edge) => edge.geometry_m.slice(1).reduce(
+      (n, p, i) => n + Math.hypot(p[0] - edge.geometry_m[i][0],
+        p[1] - edge.geometry_m[i][1]), 0) > 0.01);
+    for (const edge of meaningful) {
+      // Retain the declared vehicle orientation (including reverse motion),
+      // rather than assuming that it always faces its displacement vector.
+      const direction = Math.cos((edge.entry_heading_deg - heading) * Math.PI / 180);
+      edge.entry_heading_deg = edge.exit_heading_deg =
+        direction >= 0 ? heading : (heading + 180) % 360;
+    }
+    for (const edge of group.filter((edge) => !meaningful.includes(edge))) {
+      // A microscopic transverse connector follows its actual adjacent lane,
+      // not its near-perpendicular noise vector. Reverse edges inherit reverse
+      // lane heading from the opposite meaningful neighbour.
+      const adjacent = meaningful.find((e) => e.destination === edge.source) ??
+        meaningful.find((e) => e.source === edge.destination);
+      if (adjacent) edge.entry_heading_deg = edge.exit_heading_deg = adjacent.entry_heading_deg;
+    }
+  }
+  return compiled;
+}
+
 // Compile permitted directed edges and explicit turn pairs once. No world scans.
 export class Navigation {
   constructor(network, handling) {
@@ -9,11 +56,12 @@ export class Navigation {
     this.parkingStations = new Set(
       (network.parking?.bays ?? []).map((b) => b.id),
     );
-    for (const edge of network.edges) {
+    const compiledEdges = straightCadEdges(network.edges);
+    for (const edge of compiledEdges) {
       if (!this.out.has(edge.source)) this.out.set(edge.source, []);
       this.out.get(edge.source).push(edge);
     }
-    const edges = new Map(network.edges.map((e) => [e.id, e]));
+    const edges = new Map(compiledEdges.map((e) => [e.id, e]));
     for (const t of network.turns) {
       const incoming = edges.get(t.incoming),
         outgoing = edges.get(t.outgoing);
@@ -156,7 +204,11 @@ export class Navigation {
           ).toFixed(9),
         ),
       ];
-      const resources = [s.resource];
+      // Alignment and withdrawal occupy the same mapped origin as incident
+      // travel. Fork-only leases would allow another AGV to arrive while the
+      // first reverses into that origin. Keep its node exclusive throughout
+      // handling; subsequent departure travel already reserves that node.
+      const resources = [s.resource, `node:${this.network.station_nodes[station]}`];
       const hold = {
         position_m,
         resources,

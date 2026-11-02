@@ -171,6 +171,28 @@ export function seedWorkingStartup(run) {
     });
     (h.sharedInternalCapacity ? h.sharedInternal : h.shared).push(i);
   }
+  // User-authorized finite starting reserve, using only existing mapped slots.
+  // This is not replenishment: every added empty identity exists from time zero.
+  const emptySlots = run.input.network.storage_slots.empty_staging;
+  const reserveBefore = Object.values(h.stores.empty_staging).reduce((n, bins) => n + bins.length, 0);
+  const targetReserve = run.input.equipment_config.empty_storage_initial_bins ?? reserveBefore;
+  if (!Number.isInteger(targetReserve) || targetReserve < reserveBefore ||
+      targetReserve > 3 * emptySlots.length)
+    throw Error("Initial empty-storage target exceeds mapped capacity or removes existing bins");
+  const addedReserve = [];
+  let remaining = targetReserve - reserveBefore;
+  // Deep positions first preserve normal front/rear access for partial targets.
+  for (const slot of [...emptySlots].sort((a, b) => b.depth - a.depth || a.lane - b.lane)) {
+    const stack = h.stores.empty_staging[slot.slot] ??= [];
+    while (remaining && stack.length < 3) {
+      const i = addBin("empty_staging", slot.slot, stack.length + 1, "RESERVE");
+      run.bins[i].fruitOrigin = null;
+      stack.push(i);
+      addedReserve.push(run.bins[i].id);
+      remaining--;
+    }
+  }
+  if (remaining) throw Error("Initial empty-storage capacity could not accept declared reserve");
   h.startup = "preloaded-working-FIFO-two-SKU-spares-v2";
   h.tipperAssignments = { T1: "SKU23", T2: "SKU24" };
   for (const t of run.tippers) t.assignment = h.tipperAssignments[t.id] ?? null;
@@ -183,6 +205,12 @@ export function seedWorkingStartup(run) {
     physicalBins: run.bins.length,
     addedBins: run.bins.length - 166,
     sharedEmptyBins: sharedCount,
+    emptyStorageReserve: {
+      initialStoredBins: reserveBefore, targetBins: targetReserve,
+      finalStoredBins: targetReserve, capacityBins: 3 * emptySlots.length,
+      addedBins: addedReserve.length, addedBinIds: addedReserve,
+      boundary: "finite declared time-zero empties in existing mapped three-high storage slots",
+    },
     lowPartials,
     lowReadySpareBins: lowSpares,
     tipperAssignments: structuredClone(h.tipperAssignments),
