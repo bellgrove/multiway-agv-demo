@@ -3,7 +3,7 @@ import { RECIPES } from "./recipes.mjs";
 // Explicit initial conditions, not future arrivals, movements or replenishment.
 // The retained 166-bin fixture remains unchanged unless this profile is selected.
 export function seedWorkingStartup(run) {
-  const scope = "all";
+  const scope = "two-eight-stack-lanes";
   const h = run.hall;
   let random = (h.seed ^ 0x719ab35d) >>> 0;
   const draw = () => {
@@ -58,32 +58,70 @@ export function seedWorkingStartup(run) {
   };
   const fifoSkus = ["SKU23", "SKU24"];
   const fifo = [];
+  // The user means the two horizontal, eight-position wall FIFO lanes,
+  // not all low-volume staging or all eight wall lanes. Reuse existing storage
+  // identities before declaring additional starting bins; other FIFO stays vacant.
+  const reusable = [];
   for (const store of h.fifoStores) {
-    const slots = run.input.network.storage_slots[store];
-    const protectedLanes =
-      store === "low_staging"
-        ? new Set(h.localEmpty.slots.map((i) => slots[i].lane))
-        : new Set();
-    const lanes = [...new Set(slots.map((s) => s.lane))].filter(
-      (l) => !protectedLanes.has(l),
-    );
-    for (const slot of slots) {
-      if (protectedLanes.has(slot.lane)) continue;
-      const stack = (h.stores[store][slot.slot] ??= []);
-      // One SKU/cohort per physical column; never start with an incompatible
-      // rear stack trapped behind another SKU. Front stock is declared older.
-      const sku =
-        fifoSkus[
-          lanes.indexOf(slot.lane) < Math.ceil(lanes.length / 2) ? 0 : 1
-        ];
-      while (stack.length < 3)
-        stack.push(addBin(store, slot.slot, stack.length + 1, "FIFO"));
-      for (const i of stack) {
+    for (const [slot, stack] of Object.entries(h.stores[store])) {
+      if (store === "low_staging" && h.localEmpty.slots.includes(Number(slot)))
+        continue;
+      reusable.push(...stack);
+      h.stores[store][slot] = [];
+    }
+  }
+  const store = "wall_storage";
+  const slots = run.input.network.storage_slots[store];
+  const lanes = [...new Set(slots.map((s) => s.lane))]
+    .sort(
+      (a, b) =>
+        Math.max(
+          ...slots.filter((s) => s.lane === b).map((s) => s.centre_xy_m[1]),
+        ) -
+        Math.max(
+          ...slots.filter((s) => s.lane === a).map((s) => s.centre_xy_m[1]),
+        ),
+    )
+    .slice(0, 2);
+  const fifoLanes = [];
+  for (const [index, lane] of lanes.entries()) {
+    const positions = slots
+      .filter((s) => s.lane === lane)
+      .sort((a, b) => a.centre_xy_m[0] - b.centre_xy_m[0]);
+    if (positions.length !== 8)
+      throw Error(
+        "Working startup requires eight stack positions per FIFO lane",
+      );
+    const sku = fifoSkus[index];
+    for (const slot of positions) {
+      const stack = (h.stores[store][slot.slot] = []);
+      for (let tier = 1; tier <= 3; tier++) {
+        const i = reusable.shift() ?? addBin(store, slot.slot, tier, "FIFO");
+        Object.assign(run.bins[i], {
+          location: store,
+          origin: store,
+          owner: store,
+          slot: slot.slot,
+          tier,
+        });
+        stack.push(i);
         fill(i, sku, 1, -100 + slot.depth);
         fifo.push(i);
       }
     }
+    fifoLanes.push({
+      store,
+      lane,
+      sku,
+      flow: "right-to-left",
+      entry: "right",
+      retrieval: "left",
+      stacks: positions.length,
+      bins: positions.length * 3,
+    });
   }
+  if (reusable.length)
+    throw Error("Undeclared surplus starting FIFO identities");
   for (const m of run.machines) {
     const eligible = run.input.skus.filter(
       (s) =>
@@ -130,6 +168,7 @@ export function seedWorkingStartup(run) {
     seed: h.seed,
     fifoSkus,
     fifoBins: fifo.length,
+    fifoLanes,
     physicalBins: run.bins.length,
     addedBins: run.bins.length - 166,
     sharedEmptyBins: sharedCount,
@@ -138,7 +177,7 @@ export function seedWorkingStartup(run) {
       "explicit declared initial inventory; not replenishment or fabricated future fruit",
   };
   run.input.purpose =
-    "Preloaded working hall: full two-SKU FIFO, T1/SKU23 and T2/SKU24, seeded partial fillers and 0–2 stacker bins";
+    "Preloaded working hall: two uppermost right-to-left FIFO lanes, eight three-high stacks each, T1/SKU23 and T2/SKU24, seeded partial fillers and 0–2 stacker bins";
   run.occupancy = new Map();
   for (const b of run.bins) {
     const key = `${b.location}/${b.slot}`;
